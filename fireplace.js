@@ -9,6 +9,7 @@ nconf.file({ file: './config.json' });
 //var config = require('./config.js');
 fs = require('fs');
 var Gpio = require('onoff').Gpio; //include onoff to interact with the GPIO
+var log4js = require("log4js");
 
 
 ////////////////////////////////////////
@@ -16,6 +17,14 @@ var Gpio = require('onoff').Gpio; //include onoff to interact with the GPIO
 ////////////////////////////////////////
 var logger = function(mod,str) {
     console.log("[%s] [%s] %s", new Date().toISOString(), mod, str);
+
+    log4js.configure({
+      appenders: { fireplace: { type: "file", filename: "fireplace.log" } },
+      categories: { default: { appenders: ["fireplace"], level: "debug" } }
+    });
+    
+    const wlogger = log4js.getLogger("fireplace");
+    wlogger.info("[%s] %s", mod, str);
 }
 
 logger("Modules","Modules loaded");
