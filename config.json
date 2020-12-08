@@ -3,6 +3,24 @@
   "notify": {
     "address": "192.168.0.6",
     "port": "39500"
+  },
+  "discover":{
+    "type": "discover",
+    "devices": [
+      {
+        "type": "switch",
+        "devicetypename": "RPi Managed Switch",
+        "name": "fireplace",
+        "label": "Fireplace"
+      },
+      {
+        "type": "switch",
+        "devicetypename": "RPi Managed Switch",
+        "name": "garagedoor",
+        "label": "Garage Door"
+      }    
+    ]
   }
+
 }
   

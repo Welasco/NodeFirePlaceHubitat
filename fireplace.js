@@ -33,6 +33,7 @@ var httpport = nconf.get('httpport');
 var relaystate = 1;
 var oldswitchstate = 0;
 var newswitchstate = 0;
+var relaystategarage = 1;
 var miliolddate = new Date().getTime();
 var milinewdate = new Date().getTime();
 var firstexecution = true;
@@ -50,49 +51,195 @@ app.get("/", function (req, res) {
     res.send("<html><body><h1>FirePlace ON</h1></body></html>");
 });
 
-app.get("/api/fireplace", function (req, res) {
-    var fireplacestatus = {
-        fireplace: ""
+app.get('/api/:device', function (req, res) {
+    let device = req.params.device
+    switch (device) {
+        case fireplace:
+            var fireplacestatus = {
+                fireplace: ""
+            }
+            if (relaystate == 1) {
+                fireplacestatus.fireplace = "OFF"
+            }
+            else{
+                fireplacestatus.fireplace = "ON"
+            }
+            sendSmartThingMsg("fireplace",fireplacestatus.fireplace);
+            logger("HTTP","Request at /api/fireplace");
+            res.send(fireplacestatus);            
+            break;
+        case garagedoor:
+            var garagedoorstatus = {
+                garagedoor: ""
+            }
+            if (relaystategarage == 1) {
+                garagedoorstatus.garagedoor = "OFF"
+            }
+            else{
+                garagedoorstatus.garagedoor = "ON"
+            }
+            sendSmartThingMsg("garagedoor",garagedoorstatus.garagedoor);
+            logger("HTTP","Request at /api/garagedoor");
+            res.send(garagedoorstatus);          
+            break;
+    
+        default:
+            res.status(404).send("Device not found");
+            break;
     }
-    if (relaystate == 1) {
-        fireplacestatus.fireplace = "OFF"
-    }
-    else{
-        fireplacestatus.fireplace = "ON"
-    }
-    sendSmartThingMsg(fireplacestatus.fireplace);
-    logger("HTTP","Request at /api/fireplace");
-    res.send(fireplacestatus);
 });
 
-app.get("/api/fireplace/on", function (req, res) {
-    if (relaystate == 1) {
-        relaycontrol();
-        logger("HTTP","Request at /api/fireplace/on");
+app.get('/api/:device/:command', function (req, res) {
+    var parts = req.params.host.split(":");
+    nconf.set('notify:address', parts[0]);
+    nconf.set('notify:port', parts[1]);
+    let device = req.params.device
+    switch (device) {
+        case fireplace:
+            switch (command) {
+                case on:
+                    if (relaystate == 1) {
+                        relaycontrol();
+                        logger("HTTP","Request at /api/fireplace/on");
+                    }
+                    else{
+                        logger("HTTP","Relay already ON");
+                    }
+                    res.end();                
+                    break;
+
+                case off:
+                    if (relaystate == 0) {
+                        relaycontrol();
+                        logger("HTTP","Request at /api/fireplace/off");
+                    }
+                    else{
+                        logger("HTTP","Relay already OFF");
+                    }    
+                    res.end();
+                    break;
+                default:
+                    res.status(404).send("Command not found");
+                    break;
+            }
+            break;
+        case garagedoor:
+            switch (command) {
+                case on:
+                    if (relaystategarage == 1) {
+                        relaycontrolgarage();
+                        logger("HTTP","Request at /api/fireplace/on");
+                    }
+                    else{
+                        logger("HTTP","Relay GarageDoor already ON");
+                    }
+                    res.end();                
+                    break;
+
+                case off:
+                    if (relaystategarage == 0) {
+                        relaycontrolgarage();
+                        logger("HTTP","Request at /api/fireplace/off");
+                    }
+                    else{
+                        logger("HTTP","Relay GarageDoor already OFF");
+                    }    
+                    res.end();
+                    break;
+                default:
+                    res.status(404).send("Command not found");
+                    break;
+            }        
+            break;            
+    
+        default:
+            res.status(404).send("Device not found");
+            break;
     }
-    else{
-        logger("HTTP","Relay already ON");
-    }
-    res.end();
 });
 
-app.get("/api/fireplace/off", function (req, res) {
-    if (relaystate == 0) {
-        relaycontrol();
-        logger("HTTP","Request at /api/fireplace/off");
-    }
-    else{
-        logger("HTTP","Relay already OFF");
-    }    
+/**
+ * discover
+ */
+// Used to send all devices back
+app.get("/discover", function (req, res) {
+    devicesDiscover();
     res.end();
-});
+}); 
 
-app.get("/api/garagedoor", function (req, res) {
-    relaycontrolgarage();
-    logger("HTTP","Request at /api/garagedoor");
-    //res.send("200 OK");
-    res.end();
-});
+// app.get("/api/fireplace", function (req, res) {
+//     var fireplacestatus = {
+//         fireplace: ""
+//     }
+//     if (relaystate == 1) {
+//         fireplacestatus.fireplace = "OFF"
+//     }
+//     else{
+//         fireplacestatus.fireplace = "ON"
+//     }
+//     sendSmartThingMsg("fireplace",fireplacestatus.fireplace);
+//     logger("HTTP","Request at /api/fireplace");
+//     res.send(fireplacestatus);
+// });
+
+// app.get("/api/fireplace/on", function (req, res) {
+//     if (relaystate == 1) {
+//         relaycontrol();
+//         logger("HTTP","Request at /api/fireplace/on");
+//     }
+//     else{
+//         logger("HTTP","Relay already ON");
+//     }
+//     res.end();
+// });
+
+// app.get("/api/fireplace/off", function (req, res) {
+//     if (relaystate == 0) {
+//         relaycontrol();
+//         logger("HTTP","Request at /api/fireplace/off");
+//     }
+//     else{
+//         logger("HTTP","Relay already OFF");
+//     }    
+//     res.end();
+// });
+
+// app.get("/api/garagedoor", function (req, res) {
+//     var garagedoorstatus = {
+//         garagedoor: ""
+//     }
+//     if (relaystategarage == 1) {
+//         garagedoorstatus.garagedoor = "OFF"
+//     }
+//     else{
+//         garagedoorstatus.garagedoor = "ON"
+//     }
+//     sendSmartThingMsg("garagedoor",garagedoorstatus.garagedoor);
+//     logger("HTTP","Request at /api/garagedoor");
+//     res.send(garagedoorstatus);    
+// });
+
+// app.get("/api/garagedoor/on", function (req, res) {
+//     if (relaystategarage == 1) {
+//         relaycontrolgarage();
+//         logger("HTTP","Request at /api/fireplace/on");
+//     }
+//     else{
+//         logger("HTTP","Relay GarageDoor already ON");
+//     }
+//     res.end();
+// });
+
+// app.get("/api/garagedoor/off", function (req, res) {
+//     if (relaystategarage == 0) {
+//         relaycontrolgarage();
+//         logger("HTTP","Request at /api/fireplace/off");
+//     }
+//     else{
+//         logger("HTTP","Relay GarageDoor already OFF");
+//     }    
+//     res.end();
+// });
 
 /**
  * Subscribe route used by SmartThings Hub to register for callback/notifications and write to config.json
@@ -113,6 +260,7 @@ app.get('/subscribe/:host', function (req, res) {
     logger("Subscribe","SmartThings HUB IpAddress: "+parts[0] +" Port: "+ parts[1]);
 });
 
+
 logger("HTTP Endpoint","All HTTP endpoints loaded");
 
 ////////////////////////////////////////
@@ -129,15 +277,16 @@ logger("HTTP Endpoint","HTTP Server Created at port: "+httpport);
 var pushButton = new Gpio(4, 'in', 'both'); //use GPIO pin 17 as input, and 'both' button presses, and releases should be handled
 //var relay = new Gpio(23, 'out')
 var relay;
+var relaygarage;
 //var relaygarage = new Gpio(24, 'out') // When the object is instanciated the relay turns on. It cannot be done here.
 
 ///////////////////////////////////////////
 // Function to send fireplace msgs to SmartThing
 ///////////////////////////////////////////
-function sendSmartThingMsg(command) {
-    var msg = JSON.stringify({command: command});
+function sendSmartThingMsg(device,command) {
+    var msg = JSON.stringify({device: device,command: command});
     notify(msg);
-    logger("SendMartthingsMsg","Sending SmartThing comand: " + msg);
+    logger("SendHubitatMsg","Sending SmartThing comand: " + msg);
 }
 
 ///////////////////////////////////////////
@@ -172,6 +321,16 @@ var notify = function(data) {
     });
     req.write(data);
     req.end();
+}
+
+function devicesDiscover(){
+    if (nconf.get('discover')) {
+        notify(JSON.stringify(nconf.get('discover')));
+        logger("devicesDiscover","Sending devices back: " + JSON.stringify(nconf.get('discover')));
+    } else {
+        logger("devicesDiscover","discover config json not set.");
+    }
+    return;
 }
 
 function createID() {
@@ -247,24 +406,30 @@ function relaycontrol(){
         logger("RELALAYCONTROL","Changing Relay State to ON: " + relaystate);
         relay.writeSync(relaystate);
         //LED.writeSync(relaystate);
-        sendSmartThingMsg("ON");
+        sendSmartThingMsg("fireplace","ON");
         // Call to SmartThings to update the App
     }else{
         relaystate = 1;
         logger("RELALAYCONTROL","Changing Relay State to OFF: " + relaystate);
         relay.writeSync(relaystate);
         //LED.writeSync(relaystate);
-        sendSmartThingMsg("OFF");
+        sendSmartThingMsg("fireplace","OFF");
         // Call to SmartThings to update the App
     }
 };
 
 function relaycontrolgarage() {
-    logger("RELALAYCONTROLGARAGE","Changing Relay State to ON: " + relaystate);
-    var relaygarage = new Gpio(24, 'out')
+    logger("RELALAYCONTROLGARAGE","Changing Relay State to ON: " + relaystategarage);
+    if (Object.prototype.toString.call(relaygarage) != "[object Object]") {
+        relaygarage = new Gpio(24, 'out');
+    }    
     relaygarage.writeSync(0);
+    relaystategarage = 0;
+    sendSmartThingMsg("garagedoor","ON");
     setTimeout(function() {
-        logger("RELALAYCONTROLGARAGE","Changing Relay State to OFF: " + relaystate);
+        logger("RELALAYCONTROLGARAGE","Changing Relay State to OFF: " + relaystategarage);
+        sendSmartThingMsg("garagedoor","OFF");
         relaygarage.writeSync(1);
+        relaystategarage = 1;
      }, 1500);
 }
