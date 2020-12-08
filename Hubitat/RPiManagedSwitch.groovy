@@ -9,7 +9,7 @@ metadata {
 
 def Rpiparse(String description) {
     def msg = description
-    parent.writeLog("${settings.name} - Rpiparse Device Type - Processing command: $msg")
+    parent.writeLog("${device.getName()} - Rpiparse Device Type - Processing command: $msg")
     
     if(msg == "ON"){
         sendEvent(name: "switch", value: "on")
@@ -20,18 +20,18 @@ def Rpiparse(String description) {
 
 // Implement "switch"
 def on() {
-    parent.writeLog("${settings.name} - RPi Managed Switch Device Type - Sending command ON")
-    sendRaspberryCommand("${settings.name}/on")    
+    parent.writeLog("${device.getName()} - RPi Managed Switch Device Type - Sending command ON")
+    sendRaspberryCommand("${device.getName()}/on")    
 }
 
 def off() {
-    parent.writeLog("${settings.name} - RPi Managed Switch Device Type - Sending command OFF")
-    sendRaspberryCommand("${settings.name}/off")  
+    parent.writeLog("${device.getName()} - RPi Managed Switch Device Type - Sending command OFF")
+    sendRaspberryCommand("${device.getName()}/off")  
 }
 
 def refresh() {
-    parent.writeLog("${settings.name} - RPi Managed Switch Device Type - Sending command Refresh")
-    sendRaspberryCommand("${settings.name}")
+    parent.writeLog("${device.getName()} - RPi Managed Switch Device Type - Sending command Refresh")
+    sendRaspberryCommand("${device.getName()}")
 }
 
 def sendRaspberryCommand(String command) {

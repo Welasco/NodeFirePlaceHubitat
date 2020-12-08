@@ -18,7 +18,13 @@
         "devicetypename": "RPi Managed Switch",
         "name": "garagedoor",
         "label": "Garage Door"
-      }    
+      },
+      {
+        "type": "temperature",
+        "devicetypename": "RPi Managed Temperature",
+        "name": "fireplacetemperature",
+        "label": "Fireplace Temperature"
+      }
     ]
   }
 

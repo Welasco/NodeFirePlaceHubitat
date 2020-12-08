@@ -110,9 +110,11 @@ private addFirstDeviceType(){
 }
 
 private addChildDevices(devices) {
+  writeLog("RPiManagedApp - Start addChildDevices: ${devices}")
   def firstdevice = 0
   def deviceId = ""
   devices.each {
+    writeLog("RPiManagedApp - addChildDevices DeviceNum: ${} ${devices}")
     if(firstdevice != 0){
       deviceId = it.name
       if (!getChildDevice(deviceId)) {
@@ -120,6 +122,9 @@ private addChildDevices(devices) {
         def d = addChildDevice("RPi Managed", it.devicetypename, deviceId, ["name": it.name, label: it.label, completedSetup: true])
         writeLog("RPiManagedApp - Added device: DisplayName: ${d.displayName} - deviceId: ${deviceId}")
       }      
+    }
+    else{
+      firstdevice = 1
     }
     // if(firstdevice == 0){
     //   deviceId = GetDeviceID()
@@ -138,11 +143,14 @@ private addChildDevices(devices) {
 
 private parserDeviceCommand(evt) {
 	def deviceid = evt.device
+  if(deviceid == "fireplace"){
+    deviceid = GetDeviceID()
+  }  
   def rpiDevice = getChildDevice(deviceid)
-  writeLog("RPiManagedApp - Method updateFireplaceDeviceType FireplaceNetworkID: ${FireplaceNetworkID}")
+  writeLog("RPiManagedApp - Method parserDeviceCommand rpiDevice: ${deviceid}")
   if(rpiDevice){
     rpiDevice.Rpiparse(evt.command)
-    writeLog("RPiManagedApp - Updating Fireplace Device ${FireplaceNetworkID} using Command: ${cmd}")
+    writeLog("RPiManagedApp - Updating rpiDevice Device ${deviceid} using Command: ${evt.command}")
   }
 
   // def FireplaceNetworkID = GetDeviceID()

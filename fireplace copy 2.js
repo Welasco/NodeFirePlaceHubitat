@@ -9,7 +9,6 @@ nconf.file({ file: './config.json' });
 //var config = require('./config.js');
 fs = require('fs');
 var Gpio = require('onoff').Gpio; //include onoff to interact with the GPIO
-var sensor = require('node-dht-sensor');
 var log4js = require("log4js");
 
 log4js.configure({
@@ -42,11 +41,9 @@ var oldswitchstate = 0;
 var newswitchstate = 0;
 var relaystategarage = 1;
 var physicalrelay = 1;
-var physicalrelaygarage = 1;
 var miliolddate = new Date().getTime();
 var milinewdate = new Date().getTime();
 var firstexecution = true;
-
 
 //////////////////////////////////////////////////////////////////
 // Creating Endpoints
@@ -91,6 +88,7 @@ api.get('/:device', function (req, res) {
                     fireplacestatus.physicalrelay = "ON"
                 }                
             }              
+
          
             sendSmartThingMsg("fireplace",fireplacestatus.fireplace);
             logger("HTTP","Request at /api/fireplace");
@@ -98,60 +96,18 @@ api.get('/:device', function (req, res) {
             break;
         case "garagedoor":
             var garagedoorstatus = {
-                garagedoor: "",
-                physicalrelaygarage: ""
+                garagedoor: ""
             }
-            if (Object.prototype.toString.call(relay) != "[object Object]") {
+            if (relaystategarage == 1) {
                 garagedoorstatus.garagedoor = "OFF"
-                garagedoorstatus.physicalrelaygarage = "NotExecuted";
-            }     
+            }
             else{
-                physicalrelaygarage = relaygarage.readSync();
-                if (relaystategarage == 1) {
-                    garagedoorstatus.garagedoor = "OFF"
-                }
-                else{
-                    garagedoorstatus.garagedoor = "ON"
-                }
-                if (physicalrelaygarage == 1) {
-                    garagedoorstatus.physicalrelaygarage = "OFF"
-                }
-                else{
-                    garagedoorstatus.physicalrelaygarage = "ON"
-                }                  
-            }       
+                garagedoorstatus.garagedoor = "ON"
+            }
             sendSmartThingMsg("garagedoor",garagedoorstatus.garagedoor);
             logger("HTTP","Request at /api/garagedoor");
             res.send(garagedoorstatus);          
             break;
-
-        case "fireplacetemperature":
-            var fireplacetemperature = {
-                vartemperatureF: "",
-                vartemperatureC: "",
-                varhumidity: ""
-            }
-            sensor.read(11, 21, function(err, temperature, humidity) {
-                if (!err) {
-        
-                    fireplacetemperature.vartemperatureF = (temperature.toFixed(1) * 9 / 5 + 32 )
-                    fireplacetemperature.vartemperatureC = (temperature.toFixed(1))
-                    fireplacetemperature.varhumidity = humidity.toFixed(1)
-                    logger("HTTP","Request at /api/fireplacetemperature");
-                    logger("HTTP","Temperature in Fahrenheit: " + fireplacetemperature.vartemperatureF + ' °F');
-                    logger("HTTP","Temperature in Celsius: " + fireplacetemperature.vartemperatureC + ' °C');
-                    logger("HTTP","Humidity: " + fireplacetemperature.varhumidity + ' %');
-
-                    var temphumi = (fireplacetemperature.vartemperatureF.toString() + "-" + fireplacetemperature.varhumidity.toString()) 
-                    sendSmartThingMsg("fireplacetemperature",temphumi);
-                    res.send(fireplacetemperature);
-                }
-                else{
-                    logger("HTTP","Error: " + err);
-                    res.send("Error: " + err);
-                }
-            });       
-            break;            
     
         default:
             res.status(404).send("Device not found");
@@ -183,10 +139,6 @@ api.get('/:device/:command', function (req, res) {
                         logger("HTTP","Request at /api/fireplace/off");
                     }
                     else{
-                        if (Object.prototype.toString.call(relay) == "[object Object]") {
-                            relay.writeSync(1);
-                            relaystate = relay.readSync();
-                        }    
                         logger("HTTP","Relay already OFF");
                     }    
                     res.end();
@@ -211,7 +163,7 @@ api.get('/:device/:command', function (req, res) {
 
                 case "off":
                     if (relaystategarage == 0) {
-                        //relaycontrolgarage();
+                        relaycontrolgarage();
                         logger("HTTP","Request at /api/fireplace/off");
                     }
                     else{
@@ -467,9 +419,6 @@ pushButton.watch(function (err, value) { //Watch for hardware interrupts on push
 });
 
 function relaycontrol(){
-    if (Object.prototype.toString.call(relay) == "[object Object]") {
-        relaystate = relay.readSync();
-    }    
     //relaystate = relay.readSync();
     //relaystate = LED.readSync();
     logger("RELALAYCONTROL","Relay State value: " + relaystate);
@@ -509,55 +458,3 @@ function relaycontrolgarage() {
         relaystategarage = 1;
      }, 1500);
 }
-
-// ####################################
-// ######## Temperature Code ##########
-// ####################################
-function collecttemperature(){
-    
-    sensor.read(11, 21, function(err, temperature, humidity) {
-        if (!err) {
-
-            var vartemperatureF = (temperature.toFixed(1) * 9 / 5 + 32 )
-            var vartemperatureC = (temperature.toFixed(1))
-            var varhumidity = humidity.toFixed(1)
-
-            logger("collecttemperature","Temperature in Fahrenheit: " + vartemperatureF + ' °F');
-            logger("collecttemperature","Temperature in Celsius: " + vartemperatureC + ' °C');
-            logger("collecttemperature","Humidity: " + varhumidity + ' %');
-            var temphumi = (vartemperatureF.toString() + "-" + varhumidity.toString()) 
-            sendSmartThingMsg("fireplacetemperature",temphumi);
-        }
-        else{
-            logger("collecttemperature","Error: " + err);
-        }
-    });    
-    
-
-};
-
-
-function celsiusToFahrenheit(celsius)
-{
-  var cTemp = celsius;
-  var cToFahr = cTemp * 9 / 5 + 32;
-  var message = cTemp+'\xB0C is ' + cToFahr + ' \xB0F.';
-  return cToFahr;
-  //  console.log(message);
-}
-
-function fahrenheitToCelsius(fahrenheit)
-{
-  var fTemp = fahrenheit;
-  var fToCel = (fTemp - 32) * 5 / 9;
-  var message = fTemp+'\xB0F is ' + fToCel + '\xB0C.';
-  //  console.log(message);
-}
-
-
-interval = setInterval(function () { //#C
-    collecttemperature()
-}, 900000);
-
-// 5 seconds is 5000
-// 15 minutes is 900000
