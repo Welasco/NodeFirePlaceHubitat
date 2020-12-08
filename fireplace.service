@@ -3,13 +3,13 @@ Description=Fireplace
 After=network.target
 
 [Service]
-ExecStart=/home/pi/NodeFirePlace/fireplace.js
+ExecStart=/home/pi/NodeFirePlaceHubitat/fireplace.js
 Restart=always
 User=pi
 Group=pi
 Environment=PATH=/usr/bin:/usr/local/bin
 Environment=NODE_ENV=production
-WorkingDirectory=/home/pi/NodeFirePlace
+WorkingDirectory=/home/pi/NodeFirePlaceHubitat
 
 [Install]
 WantedBy=multi-user.target
