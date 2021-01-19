@@ -65,7 +65,7 @@ app.get("/", function (req, res) {
 
 api.get('/:device', function (req, res) {
     let device = req.params['device']
-    logger("/api/:device","Received request at: " + device);
+    logger("/api/:device","Received request at: " + device + " " + command + "Source IP: "+ip);
     switch (device) {
         case "fireplace":
             var fireplacestatus = {
@@ -163,7 +163,7 @@ api.get('/:device/:command', function (req, res) {
     let device = req.params['device']
     let command = req.params['command']
     let ip = req.ip;
-    logger("/api/"+device+"/"+command,"Received request at: " + device + " " + command) + "Source IP: "+ip;
+    logger("/api/"+device+"/"+command,"Received request at: " + device + " " + command + "Source IP: "+ip);
     switch (device) {
         case "fireplace":
             switch (command) {
