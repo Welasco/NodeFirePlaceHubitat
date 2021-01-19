@@ -162,7 +162,8 @@ api.get('/:device', function (req, res) {
 api.get('/:device/:command', function (req, res) {
     let device = req.params['device']
     let command = req.params['command']
-    logger("/api/:device/:command","Received request at: " + device + " " + command);
+    let ip = req.ip;
+    logger("/api/"+device+"/"+command,"Received request at: " + device + " " + command) + "Source IP: "+ip;
     switch (device) {
         case "fireplace":
             switch (command) {
@@ -201,7 +202,7 @@ api.get('/:device/:command', function (req, res) {
                 case "on":
                     if (relaystategarage == 1) {
                         relaycontrolgarage();
-                        logger("HTTP","Request at /api/fireplace/on");
+                        logger("HTTP","Request at /api/garagedoor/on");
                     }
                     else{
                         logger("HTTP","Relay GarageDoor already ON");
@@ -212,7 +213,7 @@ api.get('/:device/:command', function (req, res) {
                 case "off":
                     if (relaystategarage == 0) {
                         //relaycontrolgarage();
-                        logger("HTTP","Request at /api/fireplace/off");
+                        logger("HTTP","Request at /api/garagedoor/off");
                     }
                     else{
                         logger("HTTP","Relay GarageDoor already OFF");
