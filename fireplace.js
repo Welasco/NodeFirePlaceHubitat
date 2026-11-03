@@ -355,7 +355,7 @@ logger("HTTP Endpoint","HTTP Server Created at port: "+httpport);
 function sendSmartThingMsg(device,command) {
     var msg = JSON.stringify({device: device,command: command});
     notify(msg);
-    logger("SendHubitatMsg","Sending SmartThing comand: " + msg);
+    logger("SendHubitatMsg","Queued Hubitat state: " + msg);
 }
 
 ///////////////////////////////////////////
@@ -365,31 +365,127 @@ function sendSmartThingMsg(device,command) {
  * Callback to the SmartThings Hub via HTTP NOTIFY
  * @param {String} data - The HTTP message body
  */
+var notificationQueue = new Map();
+var notificationInFlight = false;
+var notificationTimeout = 5000;
+var notificationRetryDelays = [5000, 15000, 30000];
+
 var notify = function(data) {
-    if (!nconf.get('notify:address') || nconf.get('notify:address').length == 0 ||
-      !nconf.get('notify:port') || nconf.get('notify:port') == 0) {
-      logger("Notify","Notify server address and port not set!");
-      return;
+    var message = JSON.parse(data);
+    var key = message.device ? 'device:' + message.device : 'type:' + message.type;
+    var entry = notificationQueue.get(key);
+    if (entry) {
+        entry.data = data;
+        entry.version++;
+    } else {
+        notificationQueue.set(key, {
+            key: key,
+            device: message.device,
+            data: data,
+            version: 0,
+            retries: 0,
+            retryTimer: null
+        });
+    }
+    flushnotifications();
+}
+
+function flushnotifications() {
+    if (notificationInFlight) return;
+    var entry = Array.from(notificationQueue.values()).find(function (item) {
+        return item.retryTimer === null;
+    });
+    if (!entry) return;
+
+    notificationInFlight = true;
+    var version = entry.version;
+    sendnotification(entry, function (err) {
+        notificationInFlight = false;
+        if (err) {
+            logger("Notify","Notification error for " + entry.key + ": " + err.message);
+            if (entry.retries < notificationRetryDelays.length) {
+                var delay = notificationRetryDelays[entry.retries++];
+                logger("Notify","Retrying " + entry.key + " in " + delay + "ms");
+                entry.retryTimer = setTimeout(function () {
+                    entry.retryTimer = null;
+                    flushnotifications();
+                }, delay);
+            } else {
+                notificationQueue.delete(entry.key);
+                logger("Notify","Retries exhausted for " + entry.key + "; a new update or periodic relay snapshot is required");
+            }
+        } else {
+            logger("Notify","Hubitat accepted notification for " + entry.key);
+            notificationQueue.delete(entry.key);
+            if (entry.version !== version) {
+                entry.retries = 0;
+                notificationQueue.set(entry.key, entry);
+            }
+        }
+        flushnotifications();
+    });
+}
+
+function sendnotification(entry,callback) {
+    var req;
+    var timeout;
+    var finished = false;
+    function finish(err) {
+        if (finished) return;
+        finished = true;
+        if (timeout !== undefined) clearTimeout(timeout);
+        if (err && req) req.destroy();
+        callback(err);
     }
 
-    var opts = {
-      method: 'NOTIFY',
-      host: nconf.get('notify:address'),
-      port: nconf.get('notify:port'),
-      path: '/notify',
-      headers: {
-        'CONTENT-TYPE': 'application/json',
-        'CONTENT-LENGTH': Buffer.byteLength(data),
-        'device': 'fireplace'
-      }
-    };
-
-    var req = http.request(opts);
-    req.on('error', function(err, req, res) {
-      logger("Notify","Notify error: "+err);
-    });
-    req.write(data);
-    req.end();
+    try {
+        if (!nconf.get('notify:address') || !nconf.get('notify:port')) {
+            throw new Error('Notify server address and port not set');
+        }
+        var data = entry.data;
+        // Queued or retried relay messages must describe the output now, not an old pulse.
+        if (entry.device === 'fireplace') {
+            physicalrelay = readrelaystate("fireplace",relay,relaystate);
+            data = JSON.stringify({device: entry.device, command: physicalrelay == 0 ? "ON" : "OFF"});
+        } else if (entry.device === 'garagedoor') {
+            physicalrelaygarage = readrelaystate("garagedoor",relaygarage,relaystategarage);
+            data = JSON.stringify({device: entry.device, command: physicalrelaygarage == 0 ? "ON" : "OFF"});
+        }
+        var opts = {
+            method: 'NOTIFY',
+            host: nconf.get('notify:address'),
+            port: nconf.get('notify:port'),
+            path: '/notify',
+            headers: {
+                'CONTENT-TYPE': 'application/json',
+                'CONTENT-LENGTH': Buffer.byteLength(data),
+                'device': 'fireplace'
+            }
+        };
+        req = http.request(opts, function (res) {
+            res.on('error', finish);
+            res.on('aborted', function () {
+                finish(new Error('Hubitat response was interrupted'));
+            });
+            res.on('end', function () {
+                if (res.statusCode >= 200 && res.statusCode < 300) {
+                    finish();
+                } else {
+                    finish(new Error('Hubitat returned HTTP ' + res.statusCode));
+                }
+            });
+            res.resume();
+        });
+        req.on('error', finish);
+        timeout = setTimeout(function () {
+            finish(new Error('Hubitat notification timed out after ' + notificationTimeout + 'ms'));
+        }, notificationTimeout);
+        logger("Notify","Sending notification: " + data);
+        req.write(data);
+        req.end();
+    } catch (err) {
+        finish(err);
+    }
 }
 
 function readrelaystate(device,gpio,trackedstate) {
@@ -414,6 +510,14 @@ function reportrelaystates() {
 }
 
 reportrelaystates();
+
+setInterval(function () {
+    try {
+        reportrelaystates();
+    } catch (err) {
+        logger("GPIO","Relay state reconciliation error: " + err.message);
+    }
+}, 300000);
 
 function devicesDiscover(){
     if (nconf.get('discover')) {

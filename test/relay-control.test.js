@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
+const { EventEmitter } = require('node:events');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'fireplace.js'), 'utf8');
 
@@ -12,7 +13,9 @@ function loadApp() {
     const events = [];
     const messages = [];
     const requests = [];
+    const outgoing = [];
     const timers = [];
+    const intervals = [];
     const saves = [];
     const logs = [];
     const config = {
@@ -21,6 +24,7 @@ function loadApp() {
         'notify:port': 39500
     };
     let notificationError;
+    let autoRespond = true;
     const app = {
         use() {},
         get(route, handler) { routes.set(route, handler); }
@@ -55,18 +59,31 @@ function loadApp() {
         },
         http: {
             createServer() { return { listen() {} }; },
-            request(options) {
+            request(options, onResponse) {
                 if (notificationError) throw notificationError;
                 requests.push(options);
                 let message;
-                return {
-                    on() {},
-                    write(data) { message = JSON.parse(data); },
-                    end() {
-                        messages.push(message);
-                        events.push(['notify', message.device, message.command]);
-                    }
+                const request = new EventEmitter();
+                request.write = data => { message = JSON.parse(data); };
+                request.end = () => {
+                    messages.push(message);
+                    events.push(['notify', message.device, message.command]);
+                    if (autoRespond) request.respond(200);
                 };
+                request.destroy = () => { request.destroyed = true; };
+                request.fail = error => request.emit('error', error);
+                request.respond = (statusCode, end = true) => {
+                    const response = new EventEmitter();
+                    response.statusCode = statusCode;
+                    response.resume = () => {
+                        response.resumed = true;
+                        if (end) response.emit('end');
+                    };
+                    onResponse(response);
+                    return response;
+                };
+                outgoing.push(request);
+                return request;
             }
         },
         https: {},
@@ -88,12 +105,25 @@ function loadApp() {
         },
         console: { log(...args) { logs.push(args); }, error() {} },
         Buffer,
-        setInterval() {},
-        setTimeout(callback, delay) {
+        setInterval(callback, delay) {
             const timer = { callback, delay };
+            intervals.push(timer);
+            return timer;
+        },
+        setTimeout(callback, delay) {
+            const timer = {
+                delay,
+                active: true,
+                callback() {
+                    if (!this.active) return;
+                    this.active = false;
+                    callback();
+                }
+            };
             timers.push(timer);
             return timer;
-        }
+        },
+        clearTimeout(timer) { timer.active = false; }
     });
     vm.runInContext(source, context, { filename: 'fireplace.js' });
     const startupMessages = messages.slice();
@@ -101,12 +131,21 @@ function loadApp() {
     events.length = 0;
     messages.length = 0;
     requests.length = 0;
+    outgoing.length = 0;
     logs.length = 0;
     return {
-        context, events, messages, requests, timers, logs, startupMessages, startupEvents,
+        context, events, messages, requests, outgoing, intervals, logs, startupMessages, startupEvents,
+        allTimers: timers,
+        get timers() { return timers.filter(timer => timer.delay === 1500); },
         fireplace: gpios.get(535),
         garage: gpios.get(536),
         setNotificationError(error) { notificationError = error; },
+        setAutoRespond(value) { autoRespond = value; },
+        retry(device) {
+            const entry = context.notificationQueue.get('device:' + device);
+            assert.ok(entry && entry.retryTimer, 'Expected a pending retry for ' + device);
+            return entry.retryTimer;
+        },
         status(device) {
             let body;
             routes.get('/:device')({
@@ -161,6 +200,7 @@ test('fireplace commands set their target despite stale cached state and confirm
     assert.deepEqual(app.events, [1, 0, 0, 1, 1].flatMap(value => [
         ['write', 535, value],
         ['read', 535, value],
+        ['read', 535, value],
         ['notify', 'fireplace', value === 0 ? 'ON' : 'OFF']
     ]));
     assert.equal(app.context.relaystate, 1);
@@ -190,11 +230,11 @@ test('garage repeats report confirmed state without restarting or shortening the
     app.timers[0].callback();
     app.command('garagedoor', 'off');
     assert.deepEqual(app.events, [
-        ['write', 536, 0], ['read', 536, 0], ['notify', 'garagedoor', 'ON'],
-        ['read', 536, 0], ['notify', 'garagedoor', 'ON'],
-        ['read', 536, 0], ['notify', 'garagedoor', 'ON'],
-        ['write', 536, 1], ['read', 536, 1], ['notify', 'garagedoor', 'OFF'],
-        ['read', 536, 1], ['notify', 'garagedoor', 'OFF']
+        ['write', 536, 0], ['read', 536, 0], ['read', 536, 0], ['notify', 'garagedoor', 'ON'],
+        ['read', 536, 0], ['read', 536, 0], ['notify', 'garagedoor', 'ON'],
+        ['read', 536, 0], ['read', 536, 0], ['notify', 'garagedoor', 'ON'],
+        ['write', 536, 1], ['read', 536, 1], ['read', 536, 1], ['notify', 'garagedoor', 'OFF'],
+        ['read', 536, 1], ['read', 536, 1], ['notify', 'garagedoor', 'OFF']
     ]);
     assert.equal(app.context.relaystategarage, 1);
     assert.equal(app.context.garagePulseTimer, null);
@@ -219,15 +259,17 @@ test('garage verification failures never announce an unconfirmed ON state', () =
     }
 });
 
-test('garage release remains scheduled when the ON notification throws', () => {
+test('notification setup failures do not fail garage commands or delay their release', () => {
     const app = loadApp();
     app.setNotificationError(new Error('Notification failed'));
-    assert.throws(() => app.command('garagedoor', 'on'), /Notification failed/);
+    app.command('garagedoor', 'on');
     assert.equal(app.garage.value, 0);
     assert.equal(app.timers.length, 1);
     app.setNotificationError(undefined);
     app.timers[0].callback();
     assert.equal(app.garage.value, 1);
+    assert.deepEqual(app.messages, []);
+    app.retry('garagedoor').callback();
     assert.deepEqual(app.messages, [{ device: 'garagedoor', command: 'OFF' }]);
 });
 
@@ -249,8 +291,8 @@ test('startup publishes both confirmed OFF states after reading both outputs', (
         { device: 'garagedoor', command: 'OFF' }
     ]);
     assert.deepEqual(app.startupEvents.slice(-4), [
-        ['read', 535, 1], ['read', 536, 1],
-        ['notify', 'fireplace', 'OFF'], ['notify', 'garagedoor', 'OFF']
+        ['read', 535, 1], ['notify', 'fireplace', 'OFF'],
+        ['read', 536, 1], ['notify', 'garagedoor', 'OFF']
     ]);
     assert.equal(app.startupEvents.some(event => event[0] === 'write'), false);
 });
@@ -359,4 +401,196 @@ test('subscription snapshot errors reach Express error handling without a succes
     assert.equal(response.error, error);
     assert.equal(response.ended, false);
     assert.deepEqual(app.messages, []);
+});
+
+test('notification requests are serialized and pending updates coalesce to the latest state', () => {
+    const app = loadApp();
+    app.setAutoRespond(false);
+    app.command('fireplace', 'on');
+    app.command('fireplace', 'off');
+    app.command('fireplace', 'on');
+    app.command('fireplace', 'off');
+    assert.equal(app.outgoing.length, 1);
+    assert.equal(app.context.notificationQueue.size, 1);
+    app.outgoing[0].respond(200);
+    assert.equal(app.outgoing.length, 2);
+    assert.deepEqual(app.messages, [
+        { device: 'fireplace', command: 'ON' },
+        { device: 'fireplace', command: 'OFF' }
+    ]);
+    app.outgoing[1].respond(204);
+    assert.equal(app.context.notificationQueue.size, 0);
+    assert.equal(app.context.notificationInFlight, false);
+    assert.equal(app.allTimers.some(timer => timer.active), false);
+});
+
+test('garage pulses finish while another notification is waiting for its response', () => {
+    const app = loadApp();
+    app.setAutoRespond(false);
+    app.command('fireplace', 'on');
+    app.command('garagedoor', 'on');
+    assert.equal(app.outgoing.length, 1);
+    app.timers[0].callback();
+    assert.equal(app.garage.value, 1);
+    assert.equal(app.context.garagePulseTimer, null);
+    app.outgoing[0].respond(200);
+    assert.deepEqual(app.messages, [
+        { device: 'fireplace', command: 'ON' },
+        { device: 'garagedoor', command: 'OFF' }
+    ]);
+    assert.deepEqual(app.events.filter(event => event[0] === 'write'), [
+        ['write', 535, 0], ['write', 536, 0], ['write', 536, 1]
+    ]);
+});
+
+test('notification retries re-read GPIO instead of replaying an obsolete ON payload', () => {
+    const app = loadApp();
+    app.setAutoRespond(false);
+    app.command('garagedoor', 'on');
+    app.outgoing[0].fail(new Error('Connection refused'));
+    assert.equal(app.retry('garagedoor').delay, 5000);
+    app.garage.value = 1;
+    app.retry('garagedoor').callback();
+    assert.deepEqual(app.messages, [
+        { device: 'garagedoor', command: 'ON' },
+        { device: 'garagedoor', command: 'OFF' }
+    ]);
+    assert.equal(app.context.relaystategarage, 0);
+    assert.deepEqual(app.events.filter(event => event[0] === 'write'), [['write', 536, 0]]);
+});
+
+test('unreadable GPIO blocks retry payloads without replaying the previous state', () => {
+    const app = loadApp();
+    app.setAutoRespond(false);
+    app.command('fireplace', 'on');
+    app.outgoing[0].fail(new Error('Connection lost'));
+    app.fireplace.readError = new Error('GPIO read failed');
+    app.retry('fireplace').callback();
+    assert.equal(app.outgoing.length, 1);
+    assert.equal(app.retry('fireplace').delay, 15000);
+    assert.deepEqual(app.messages, [{ device: 'fireplace', command: 'ON' }]);
+});
+
+test('notification deadlines destroy stalled requests and late events cannot schedule duplicate retries', () => {
+    const app = loadApp();
+    app.setAutoRespond(false);
+    app.command('garagedoor', 'on');
+    const request = app.outgoing[0];
+    const deadline = app.allTimers.find(timer => timer.active && timer.delay === 5000);
+    assert.ok(deadline);
+    app.timers[0].callback();
+    assert.equal(app.garage.value, 1);
+    deadline.callback();
+    assert.equal(request.destroyed, true);
+    const retry = app.retry('garagedoor');
+    assert.equal(retry.delay, 5000);
+    request.fail(new Error('Late socket error'));
+    request.respond(200);
+    assert.equal(app.retry('garagedoor'), retry);
+    assert.equal(app.context.notificationQueue.get('device:garagedoor').retries, 1);
+    app.setAutoRespond(true);
+    retry.callback();
+    assert.deepEqual(app.messages.at(-1), { device: 'garagedoor', command: 'OFF' });
+    assert.equal(app.context.notificationQueue.size, 0);
+});
+
+test('non-success HTTP responses and interrupted bodies retry, while successful responses clear deadlines', () => {
+    const app = loadApp();
+    app.setAutoRespond(false);
+    app.command('fireplace', 'on');
+    const response = app.outgoing[0].respond(503);
+    assert.equal(response.resumed, true);
+    app.retry('fireplace').callback();
+    const interrupted = app.outgoing[1].respond(200, false);
+    interrupted.emit('aborted');
+    assert.equal(app.retry('fireplace').delay, 15000);
+    app.retry('fireplace').callback();
+    app.outgoing[2].respond(204);
+    assert.equal(app.context.notificationQueue.size, 0);
+    assert.equal(app.allTimers.some(timer => timer.active), false);
+});
+
+test('retries stop after the approved delays and periodic reconciliation recovers current states', () => {
+    const app = loadApp();
+    app.setAutoRespond(false);
+    app.command('fireplace', 'on');
+    app.outgoing[0].fail(new Error('Hub offline'));
+    for (const delay of [5000, 15000, 30000]) {
+        const retry = app.retry('fireplace');
+        assert.equal(retry.delay, delay);
+        retry.callback();
+        app.outgoing.at(-1).fail(new Error('Hub offline'));
+    }
+    assert.equal(app.outgoing.length, 4);
+    assert.equal(app.context.notificationQueue.size, 0);
+    assert.equal(app.allTimers.some(timer => timer.active), false);
+    assert.ok(app.logs.some(args => args.some(arg =>
+        typeof arg === 'string' && arg.includes('Retries exhausted')
+    )));
+    app.garage.value = 0;
+    app.setAutoRespond(true);
+    const periodic = app.intervals.find(timer => timer.delay === 300000);
+    assert.ok(periodic);
+    periodic.callback();
+    assert.deepEqual(app.messages.slice(-2), [
+        { device: 'fireplace', command: 'ON' },
+        { device: 'garagedoor', command: 'ON' }
+    ]);
+    assert.deepEqual(app.events.filter(event => event[0] === 'write'), [['write', 535, 0]]);
+});
+
+test('a failed notification does not block delivery to a different device', () => {
+    const app = loadApp();
+    app.setAutoRespond(false);
+    app.command('fireplace', 'on');
+    app.command('garagedoor', 'on');
+    app.outgoing[0].fail(new Error('Hub busy'));
+    assert.equal(app.retry('fireplace').delay, 5000);
+    assert.equal(app.outgoing.length, 2);
+    assert.deepEqual(app.messages.at(-1), { device: 'garagedoor', command: 'ON' });
+});
+
+test('retry attempts use the current subscription address', () => {
+    const app = loadApp();
+    app.setAutoRespond(false);
+    app.command('fireplace', 'on');
+    app.outgoing[0].fail(new Error('Old hub unavailable'));
+    app.setAutoRespond(true);
+    const response = app.subscribe('127.0.0.2:39501');
+    app.completeSave();
+    assert.equal(response.ended, true);
+    app.retry('fireplace').callback();
+    assert.equal(app.requests.at(-1).host, '127.0.0.2');
+    assert.equal(app.requests.at(-1).port, '39501');
+    assert.equal(app.context.notificationQueue.size, 0);
+});
+
+test('periodic snapshot errors are logged and do not prevent a later reconciliation', () => {
+    const app = loadApp();
+    const periodic = app.intervals.find(timer => timer.delay === 300000);
+    app.garage.readError = new Error('Temporary GPIO failure');
+    periodic.callback();
+    assert.deepEqual(app.messages, []);
+    assert.ok(app.logs.some(args => args.some(arg =>
+        typeof arg === 'string' && arg.includes('Relay state reconciliation error')
+    )));
+    app.garage.readError = undefined;
+    periodic.callback();
+    assert.deepEqual(app.messages, [
+        { device: 'fireplace', command: 'OFF' },
+        { device: 'garagedoor', command: 'OFF' }
+    ]);
+});
+
+test('temperature and discovery notifications retain their existing payloads and NOTIFY headers', () => {
+    const app = loadApp();
+    const temperature = { device: 'fireplacetemperature', command: '72.0-50.0' };
+    const discovery = { type: 'discover', devices: [{ name: 'fireplace' }] };
+    app.context.notify(JSON.stringify(temperature));
+    app.context.notify(JSON.stringify(discovery));
+    assert.deepEqual(app.messages, [temperature, discovery]);
+    assert.ok(app.requests.every(request =>
+        request.method === 'NOTIFY' && request.path === '/notify' &&
+        request.headers.device === 'fireplace'
+    ));
 });
