@@ -16,7 +16,7 @@ log4js.configure({
     appenders: { fireplace: { type: "file", filename: "fireplace.log" } },
     categories: { default: { appenders: ["fireplace"], level: "debug" } }
   });
-  
+
 const wlogger = log4js.getLogger("fireplace");
 
 ////////////////////////////////////////
@@ -29,7 +29,7 @@ var logger = function(mod,str) {
     //   appenders: { fireplace: { type: "file", filename: "fireplace.log" } },
     //   categories: { default: { appenders: ["fireplace"], level: "debug" } }
     // });
-    
+
     // const wlogger = log4js.getLogger("fireplace");
     wlogger.info("[%s] %s", mod, str);
 }
@@ -65,7 +65,8 @@ app.get("/", function (req, res) {
 
 api.get('/:device', function (req, res) {
     let device = req.params['device']
-    logger("/api/:device","Received request at: " + device + " " + command + "Source IP: "+ip);
+    let ip = req.ip;
+    logger("/api/"+device,"Received request at: " + device + " Source IP: "+ip);
     switch (device) {
         case "fireplace":
             var fireplacestatus = {
@@ -89,12 +90,12 @@ api.get('/:device', function (req, res) {
                 }
                 else{
                     fireplacestatus.physicalrelay = "ON"
-                }                
-            }              
-         
+                }
+            }
+
             sendSmartThingMsg("fireplace",fireplacestatus.fireplace);
             logger("HTTP","Request at /api/fireplace");
-            res.send(fireplacestatus);            
+            res.send(fireplacestatus);
             break;
         case "garagedoor":
             var garagedoorstatus = {
@@ -104,7 +105,7 @@ api.get('/:device', function (req, res) {
             if (Object.prototype.toString.call(relay) != "[object Object]") {
                 garagedoorstatus.garagedoor = "OFF"
                 garagedoorstatus.physicalrelaygarage = "NotExecuted";
-            }     
+            }
             else{
                 physicalrelaygarage = relaygarage.readSync();
                 if (relaystategarage == 1) {
@@ -118,11 +119,11 @@ api.get('/:device', function (req, res) {
                 }
                 else{
                     garagedoorstatus.physicalrelaygarage = "ON"
-                }                  
-            }       
+                }
+            }
             sendSmartThingMsg("garagedoor",garagedoorstatus.garagedoor);
             logger("HTTP","Request at /api/garagedoor");
-            res.send(garagedoorstatus);          
+            res.send(garagedoorstatus);
             break;
 
         case "fireplacetemperature":
@@ -133,7 +134,7 @@ api.get('/:device', function (req, res) {
             }
             sensor.read(11, 21, function(err, temperature, humidity) {
                 if (!err) {
-        
+
                     fireplacetemperature.vartemperatureF = (temperature.toFixed(1) * 9 / 5 + 32 )
                     fireplacetemperature.vartemperatureC = (temperature.toFixed(1))
                     fireplacetemperature.varhumidity = humidity.toFixed(1)
@@ -142,7 +143,7 @@ api.get('/:device', function (req, res) {
                     logger("HTTP","Temperature in Celsius: " + fireplacetemperature.vartemperatureC + ' °C');
                     logger("HTTP","Humidity: " + fireplacetemperature.varhumidity + ' %');
 
-                    var temphumi = (fireplacetemperature.vartemperatureF.toString() + "-" + fireplacetemperature.varhumidity.toString()) 
+                    var temphumi = (fireplacetemperature.vartemperatureF.toString() + "-" + fireplacetemperature.varhumidity.toString())
                     sendSmartThingMsg("fireplacetemperature",temphumi);
                     res.send(fireplacetemperature);
                 }
@@ -150,9 +151,9 @@ api.get('/:device', function (req, res) {
                     logger("HTTP","Error: " + err);
                     res.send("Error: " + err);
                 }
-            });       
-            break;            
-    
+            });
+            break;
+
         default:
             res.status(404).send("Device not found");
             break;
@@ -175,7 +176,7 @@ api.get('/:device/:command', function (req, res) {
                     else{
                         logger("HTTP","Relay already ON");
                     }
-                    res.end();                
+                    res.end();
                     break;
 
                 case "off":
@@ -187,9 +188,9 @@ api.get('/:device/:command', function (req, res) {
                         if (Object.prototype.toString.call(relay) == "[object Object]") {
                             relay.writeSync(1);
                             relaystate = relay.readSync();
-                        }    
+                        }
                         logger("HTTP","Relay already OFF");
-                    }    
+                    }
                     res.end();
                     break;
                 default:
@@ -207,7 +208,7 @@ api.get('/:device/:command', function (req, res) {
                     else{
                         logger("HTTP","Relay GarageDoor already ON");
                     }
-                    res.end();                
+                    res.end();
                     break;
 
                 case "off":
@@ -217,15 +218,15 @@ api.get('/:device/:command', function (req, res) {
                     }
                     else{
                         logger("HTTP","Relay GarageDoor already OFF");
-                    }    
+                    }
                     res.end();
                     break;
                 default:
                     res.status(404).send("Command not found");
                     break;
-            }        
-            break;            
-    
+            }
+            break;
+
         default:
             res.status(404).send("Device not found");
             break;
@@ -239,7 +240,7 @@ api.get('/:device/:command', function (req, res) {
 app.get("/discover", function (req, res) {
     devicesDiscover();
     res.end();
-}); 
+});
 
 // app.get("/api/fireplace", function (req, res) {
 //     var fireplacestatus = {
@@ -274,7 +275,7 @@ app.get("/discover", function (req, res) {
 //     }
 //     else{
 //         logger("HTTP","Relay already OFF");
-//     }    
+//     }
 //     res.end();
 // });
 
@@ -290,7 +291,7 @@ app.get("/discover", function (req, res) {
 //     }
 //     sendSmartThingMsg("garagedoor",garagedoorstatus.garagedoor);
 //     logger("HTTP","Request at /api/garagedoor");
-//     res.send(garagedoorstatus);    
+//     res.send(garagedoorstatus);
 // });
 
 // app.get("/api/garagedoor/on", function (req, res) {
@@ -311,7 +312,7 @@ app.get("/discover", function (req, res) {
 //     }
 //     else{
 //         logger("HTTP","Relay GarageDoor already OFF");
-//     }    
+//     }
 //     res.end();
 // });
 
@@ -376,7 +377,7 @@ var notify = function(data) {
       logger("Notify","Notify server address and port not set!");
       return;
     }
-  
+
     var opts = {
       method: 'NOTIFY',
       host: nconf.get('notify:address'),
@@ -388,7 +389,7 @@ var notify = function(data) {
         'device': 'fireplace'
       }
     };
-  
+
     var req = http.request(opts);
     req.on('error', function(err, req, res) {
       logger("Notify","Notify error: "+err);
@@ -420,7 +421,7 @@ function switchchanged(callbackswitchsate){
     logger(swuID+"-"+"SWITCHCHANGED","Checking current switch state: " + newswitchstate);
     if (oldswitchstate != newswitchstate) {
         logger(swuID+"-"+"SWITCHCHANGED","Looks like switch was changed to: " + newswitchstate);
-        var interval = setInterval(function(){ 
+        var interval = setInterval(function(){
             newswitchstate = pushButton.readSync();
             if (icount >= checkcount) {
                 if (oldswitchstate != newswitchstate) {
@@ -435,7 +436,7 @@ function switchchanged(callbackswitchsate){
                 clearInterval(interval);
             }
             icount++;
-          }, waitcheck);        
+          }, waitcheck);
     }
     else{
         logger(swuID+"-"+"SWITCHCHANGED","Switch was not changed false positive!");
@@ -462,15 +463,15 @@ pushButton.watch(function (err, value) { //Watch for hardware interrupts on push
         }
         else{
             logger(puuID+"-"+"PUSHBUTTON","Switch not changed!");
-        }        
+        }
         //return switchchanged;
-    });    
+    });
 });
 
 function relaycontrol(){
     if (Object.prototype.toString.call(relay) == "[object Object]") {
         relaystate = relay.readSync();
-    }    
+    }
     //relaystate = relay.readSync();
     //relaystate = LED.readSync();
     logger("RELALAYCONTROL","Relay State value: " + relaystate);
@@ -499,7 +500,7 @@ function relaycontrolgarage() {
     logger("RELALAYCONTROLGARAGE","Changing Relay State to ON: " + relaystategarage);
     if (Object.prototype.toString.call(relaygarage) != "[object Object]") {
         relaygarage = new Gpio(24, 'out');
-    }    
+    }
     relaygarage.writeSync(0);
     relaystategarage = 0;
     sendSmartThingMsg("garagedoor","ON");
@@ -515,7 +516,7 @@ function relaycontrolgarage() {
 // ######## Temperature Code ##########
 // ####################################
 function collecttemperature(){
-    
+
     sensor.read(11, 21, function(err, temperature, humidity) {
         if (!err) {
 
@@ -526,14 +527,14 @@ function collecttemperature(){
             logger("collecttemperature","Temperature in Fahrenheit: " + vartemperatureF + ' °F');
             logger("collecttemperature","Temperature in Celsius: " + vartemperatureC + ' °C');
             logger("collecttemperature","Humidity: " + varhumidity + ' %');
-            var temphumi = (vartemperatureF.toString() + "-" + varhumidity.toString()) 
+            var temphumi = (vartemperatureF.toString() + "-" + varhumidity.toString())
             sendSmartThingMsg("fireplacetemperature",temphumi);
         }
         else{
             logger("collecttemperature","Error: " + err);
         }
-    });    
-    
+    });
+
 
 };
 
