@@ -74,25 +74,14 @@ api.get('/:device', function (req, res) {
                 fireplace: "",
                 physicalrelay: ""
             }
-            if (Object.prototype.toString.call(relay) != "[object Object]") {
+            physicalrelay = readrelaystate("fireplace",relay,relaystate);
+            if (physicalrelay == 1) {
                 fireplacestatus.fireplace = "OFF"
-                fireplacestatus.physicalrelay = "NotExecuted";
             }
             else{
-                physicalrelay = relay.readSync();
-                if (relaystate == 1) {
-                    fireplacestatus.fireplace = "OFF"
-                }
-                else{
-                    fireplacestatus.fireplace = "ON"
-                }
-                if (physicalrelay == 1) {
-                    fireplacestatus.physicalrelay = "OFF"
-                }
-                else{
-                    fireplacestatus.physicalrelay = "ON"
-                }
+                fireplacestatus.fireplace = "ON"
             }
+            fireplacestatus.physicalrelay = fireplacestatus.fireplace;
 
             sendSmartThingMsg("fireplace",fireplacestatus.fireplace);
             logger("HTTP","Request at /api/fireplace");
@@ -103,25 +92,14 @@ api.get('/:device', function (req, res) {
                 garagedoor: "",
                 physicalrelaygarage: ""
             }
-            if (Object.prototype.toString.call(relay) != "[object Object]") {
+            physicalrelaygarage = readrelaystate("garagedoor",relaygarage,relaystategarage);
+            if (physicalrelaygarage == 1) {
                 garagedoorstatus.garagedoor = "OFF"
-                garagedoorstatus.physicalrelaygarage = "NotExecuted";
             }
             else{
-                physicalrelaygarage = relaygarage.readSync();
-                if (relaystategarage == 1) {
-                    garagedoorstatus.garagedoor = "OFF"
-                }
-                else{
-                    garagedoorstatus.garagedoor = "ON"
-                }
-                if (physicalrelaygarage == 1) {
-                    garagedoorstatus.physicalrelaygarage = "OFF"
-                }
-                else{
-                    garagedoorstatus.physicalrelaygarage = "ON"
-                }
+                garagedoorstatus.garagedoor = "ON"
             }
+            garagedoorstatus.physicalrelaygarage = garagedoorstatus.garagedoor;
             sendSmartThingMsg("garagedoor",garagedoorstatus.garagedoor);
             logger("HTTP","Request at /api/garagedoor");
             res.send(garagedoorstatus);
@@ -308,7 +286,7 @@ app.get("/discover", function (req, res) {
  * Subscribe route used by SmartThings Hub to register for callback/notifications and write to config.json
  * @param {String} host - The SmartThings Hub IP address and port number
  */
-app.get('/subscribe/:host', function (req, res) {
+app.get('/subscribe/:host', function (req, res, next) {
     var parts = req.params.host.split(":");
     nconf.set('notify:address', parts[0]);
     nconf.set('notify:port', parts[1]);
@@ -318,9 +296,16 @@ app.get('/subscribe/:host', function (req, res) {
         res.status(500).json({ error: 'Configuration error: '+err.message });
         return;
       }
+      try {
+        reportrelaystates();
+      } catch (err) {
+        logger("Subscribe",'Relay state reporting error: '+err.message);
+        next(err);
+        return;
+      }
+      res.end();
+      logger("Subscribe","SmartThings HUB IpAddress: "+parts[0] +" Port: "+ parts[1]);
     });
-    res.end();
-    logger("Subscribe","SmartThings HUB IpAddress: "+parts[0] +" Port: "+ parts[1]);
 });
 
 
@@ -406,6 +391,29 @@ var notify = function(data) {
     req.write(data);
     req.end();
 }
+
+function readrelaystate(device,gpio,trackedstate) {
+    if (!gpio || typeof gpio.readSync !== 'function') {
+        throw new Error('Relay not initialized: ' + device);
+    }
+    var state = gpio.readSync();
+    if (state !== 0 && state !== 1) {
+        throw new Error('Invalid relay readback for ' + device + ': ' + state);
+    }
+    if (state !== trackedstate) {
+        logger("GPIO","WARNING: Relay state mismatch for " + device + ": tracked " + trackedstate + ", read " + state);
+    }
+    return state;
+}
+
+function reportrelaystates() {
+    physicalrelay = readrelaystate("fireplace",relay,relaystate);
+    physicalrelaygarage = readrelaystate("garagedoor",relaygarage,relaystategarage);
+    sendSmartThingMsg("fireplace",physicalrelay == 0 ? "ON" : "OFF");
+    sendSmartThingMsg("garagedoor",physicalrelaygarage == 0 ? "ON" : "OFF");
+}
+
+reportrelaystates();
 
 function devicesDiscover(){
     if (nconf.get('discover')) {
