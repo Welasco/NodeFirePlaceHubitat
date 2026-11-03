@@ -4,6 +4,9 @@
   "version": "0.0.0",
   "description": "Fireplace",
   "main": "fireplace.js",
+  "scripts": {
+    "start": "node fireplace.js"
+  },
   "dependencies": {
     "express": "^5.3.0",
     "nconf": "^0.13.0",
