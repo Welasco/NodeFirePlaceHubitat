@@ -41,6 +41,7 @@ var relaystate = 1;
 var oldswitchstate = 0;
 var newswitchstate = 0;
 var relaystategarage = 1;
+var garagePulseTimer = null;
 var physicalrelay = 1;
 var physicalrelaygarage = 1;
 var miliolddate = new Date().getTime();
@@ -169,28 +170,14 @@ api.get('/:device/:command', function (req, res) {
         case "fireplace":
             switch (command) {
                 case "on":
-                    if (relaystate == 1) {
-                        relaycontrol();
-                        logger("HTTP","Request at /api/fireplace/on");
-                    }
-                    else{
-                        logger("HTTP","Relay already ON");
-                    }
+                    relaycontrol(0);
+                    logger("HTTP","Request at /api/fireplace/on");
                     res.end();
                     break;
 
                 case "off":
-                    if (relaystate == 0) {
-                        relaycontrol();
-                        logger("HTTP","Request at /api/fireplace/off");
-                    }
-                    else{
-                        if (Object.prototype.toString.call(relay) == "[object Object]") {
-                            relay.writeSync(1);
-                            relaystate = relay.readSync();
-                        }
-                        logger("HTTP","Relay already OFF");
-                    }
+                    relaycontrol(1);
+                    logger("HTTP","Request at /api/fireplace/off");
                     res.end();
                     break;
                 default:
@@ -201,19 +188,20 @@ api.get('/:device/:command', function (req, res) {
         case "garagedoor":
             switch (command) {
                 case "on":
-                    if (relaystategarage == 1) {
+                    if (garagePulseTimer === null) {
                         relaycontrolgarage();
                         logger("HTTP","Request at /api/garagedoor/on");
                     }
                     else{
+                        reportgaragestate(0);
                         logger("HTTP","Relay GarageDoor already ON");
                     }
                     res.end();
                     break;
 
                 case "off":
+                    reportgaragestate(garagePulseTimer === null ? 1 : 0);
                     if (relaystategarage == 0) {
-                        //relaycontrolgarage();
                         logger("HTTP","Request at /api/garagedoor/off");
                     }
                     else{
@@ -489,41 +477,40 @@ pushButton.watch(function (err, value) { //Watch for hardware interrupts on push
     });
 });
 
-function relaycontrol(){
-    if (Object.prototype.toString.call(relay) == "[object Object]") {
-        relaystate = relay.readSync();
+function relaycontrol(requestedstate){
+    if (requestedstate !== 0 && requestedstate !== 1) {
+        throw new Error('Invalid fireplace relay state: ' + requestedstate);
     }
-    //relaystate = relay.readSync();
-    //relaystate = LED.readSync();
-    logger("RELALAYCONTROL","Relay State value: " + relaystate);
-    if (relaystate == 1) {
-        relaystate = 0;
-        logger("RELALAYCONTROL","Changing Relay State to ON: " + relaystate);
-        relay.writeSync(relaystate);
-        //LED.writeSync(relaystate);
-        sendSmartThingMsg("fireplace","ON");
-        // Call to SmartThings to update the App
-    }else{
-        relaystate = 1;
-        logger("RELALAYCONTROL","Changing Relay State to OFF: " + relaystate);
-        relay.writeSync(relaystate);
-        //LED.writeSync(relaystate);
-        sendSmartThingMsg("fireplace","OFF");
-        // Call to SmartThings to update the App
+    logger("RELALAYCONTROL","Setting Relay State to: " + requestedstate);
+    relay.writeSync(requestedstate);
+    physicalrelay = relay.readSync();
+    if (physicalrelay !== requestedstate) {
+        throw new Error('Fireplace relay verification failed: requested ' + requestedstate + ', read ' + physicalrelay);
     }
+    relaystate = physicalrelay;
+    sendSmartThingMsg("fireplace",relaystate == 0 ? "ON" : "OFF");
 };
+
+function reportgaragestate(expectedstate) {
+    physicalrelaygarage = relaygarage.readSync();
+    if (physicalrelaygarage !== expectedstate) {
+        throw new Error('Garage relay verification failed: expected ' + expectedstate + ', read ' + physicalrelaygarage);
+    }
+    relaystategarage = physicalrelaygarage;
+    sendSmartThingMsg("garagedoor",relaystategarage == 0 ? "ON" : "OFF");
+}
 
 function relaycontrolgarage() {
     logger("RELALAYCONTROLGARAGE","Changing Relay State to ON: " + relaystategarage);
-    relaygarage.writeSync(0);
-    relaystategarage = 0;
-    sendSmartThingMsg("garagedoor","ON");
-    setTimeout(function() {
+    // Keep release scheduled even if the ON write, readback, or notification fails.
+    garagePulseTimer = setTimeout(function() {
         logger("RELALAYCONTROLGARAGE","Changing Relay State to OFF: " + relaystategarage);
-        sendSmartThingMsg("garagedoor","OFF");
         relaygarage.writeSync(1);
-        relaystategarage = 1;
+        reportgaragestate(1);
+        garagePulseTimer = null;
      }, 1500);
+    relaygarage.writeSync(0);
+    reportgaragestate(0);
 }
 
 // ####################################
