@@ -7,7 +7,7 @@ var app = express();
 var nconf = require('nconf');
 nconf.file({ file: './config.json' });
 //var config = require('./config.js');
-fs = require('fs');
+var fs = require('fs');
 var Gpio = require('onoff').Gpio; //include onoff to interact with the GPIO
 var sensor = require('node-dht-sensor');
 var log4js = require("log4js");
@@ -348,8 +348,24 @@ logger("HTTP Endpoint","HTTP Server Created at port: "+httpport);
 ////////////////////////////////////////
 // Preparing GPIO
 ////////////////////////////////////////
+// onoff expects global sysfs GPIO numbers, not BCM line offsets.
+var gpioRoot = '/sys/class/gpio';
+var gpioChips = fs.readdirSync(gpioRoot).filter(function (name) {
+    return /^gpiochip\d+$/.test(name) &&
+        fs.readFileSync(gpioRoot + '/' + name + '/label', 'utf8').trim() == 'pinctrl-bcm2835';
+});
+if (gpioChips.length != 1) {
+    throw new Error('Expected one pinctrl-bcm2835 GPIO controller in ' + gpioRoot + ', found ' + gpioChips.length);
+}
+var gpioBaseValue = fs.readFileSync(gpioRoot + '/' + gpioChips[0] + '/base', 'utf8').trim();
+var gpioBase = Number(gpioBaseValue);
+if (!/^\d+$/.test(gpioBaseValue) || !Number.isSafeInteger(gpioBase)) {
+    throw new Error('Invalid sysfs GPIO base: ' + gpioBaseValue);
+}
+logger("GPIO","Using " + gpioChips[0] + " with sysfs base " + gpioBase);
+
 //var LED = new Gpio(21, 'out'); //use GPIO pin 4 as output
-var pushButton = new Gpio(4, 'in', 'both'); //use GPIO pin 17 as input, and 'both' button presses, and releases should be handled
+var pushButton = new Gpio(gpioBase + 4, 'in', 'both'); //BCM GPIO4, monitoring both edges
 //var relay = new Gpio(23, 'out')
 var relay;
 var relaygarage;
@@ -479,7 +495,7 @@ function relaycontrol(){
         relaystate = 0;
         // Checking if relay is a object or not. We need this to avoid change the relay at the initilization process
         if (Object.prototype.toString.call(relay) != "[object Object]") {
-            relay = new Gpio(23, 'out');
+            relay = new Gpio(gpioBase + 23, 'out');
         }
         logger("RELALAYCONTROL","Changing Relay State to ON: " + relaystate);
         relay.writeSync(relaystate);
@@ -499,7 +515,7 @@ function relaycontrol(){
 function relaycontrolgarage() {
     logger("RELALAYCONTROLGARAGE","Changing Relay State to ON: " + relaystategarage);
     if (Object.prototype.toString.call(relaygarage) != "[object Object]") {
-        relaygarage = new Gpio(24, 'out');
+        relaygarage = new Gpio(gpioBase + 24, 'out');
     }
     relaygarage.writeSync(0);
     relaystategarage = 0;
