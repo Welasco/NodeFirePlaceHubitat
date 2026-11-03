@@ -339,13 +339,6 @@ app.get('/subscribe/:host', function (req, res) {
 logger("HTTP Endpoint","All HTTP endpoints loaded");
 
 ////////////////////////////////////////
-// Creating Server
-////////////////////////////////////////
-var server = http.createServer(app);
-server.listen(httpport);
-logger("HTTP Endpoint","HTTP Server Created at port: "+httpport);
-
-////////////////////////////////////////
 // Preparing GPIO
 ////////////////////////////////////////
 // onoff expects global sysfs GPIO numbers, not BCM line offsets.
@@ -364,12 +357,24 @@ if (!/^\d+$/.test(gpioBaseValue) || !Number.isSafeInteger(gpioBase)) {
 }
 logger("GPIO","Using " + gpioChips[0] + " with sysfs base " + gpioBase);
 
-//var LED = new Gpio(21, 'out'); //use GPIO pin 4 as output
+// 'high' initializes these active-low relays OFF without an initial LOW pulse.
+var relay = new Gpio(gpioBase + 23, 'high');
+var relaygarage = new Gpio(gpioBase + 24, 'high');
+relaystate = relay.readSync();
+relaystategarage = relaygarage.readSync();
+if (relaystate !== 1 || relaystategarage !== 1) {
+    throw new Error('Relay initialization failed: both relays must be OFF before starting the HTTP server');
+}
+logger("GPIO","Both relays initialized OFF");
+
 var pushButton = new Gpio(gpioBase + 4, 'in', 'both'); //BCM GPIO4, monitoring both edges
-//var relay = new Gpio(23, 'out')
-var relay;
-var relaygarage;
-//var relaygarage = new Gpio(24, 'out') // When the object is instanciated the relay turns on. It cannot be done here.
+
+////////////////////////////////////////
+// Creating Server
+////////////////////////////////////////
+var server = http.createServer(app);
+server.listen(httpport);
+logger("HTTP Endpoint","HTTP Server Created at port: "+httpport);
 
 ///////////////////////////////////////////
 // Function to send fireplace msgs to SmartThing
@@ -493,10 +498,6 @@ function relaycontrol(){
     logger("RELALAYCONTROL","Relay State value: " + relaystate);
     if (relaystate == 1) {
         relaystate = 0;
-        // Checking if relay is a object or not. We need this to avoid change the relay at the initilization process
-        if (Object.prototype.toString.call(relay) != "[object Object]") {
-            relay = new Gpio(gpioBase + 23, 'out');
-        }
         logger("RELALAYCONTROL","Changing Relay State to ON: " + relaystate);
         relay.writeSync(relaystate);
         //LED.writeSync(relaystate);
@@ -514,9 +515,6 @@ function relaycontrol(){
 
 function relaycontrolgarage() {
     logger("RELALAYCONTROLGARAGE","Changing Relay State to ON: " + relaystategarage);
-    if (Object.prototype.toString.call(relaygarage) != "[object Object]") {
-        relaygarage = new Gpio(gpioBase + 24, 'out');
-    }
     relaygarage.writeSync(0);
     relaystategarage = 0;
     sendSmartThingMsg("garagedoor","ON");
