@@ -20,6 +20,12 @@
         "label": "Garage Door"
       },
       {
+        "type": "switch",
+        "devicetypename": "RPi Managed Switch",
+        "name": "garagegate",
+        "label": "Garage Gate"
+      },
+      {
         "type": "temperature",
         "devicetypename": "RPi Managed Temperature",
         "name": "fireplacetemperature",

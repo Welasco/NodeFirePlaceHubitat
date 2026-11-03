@@ -7,7 +7,7 @@ const { EventEmitter } = require('node:events');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'fireplace.js'), 'utf8');
 
-function loadApp() {
+function loadApp(options = {}) {
     const routes = new Map();
     const gpios = new Map();
     const events = [];
@@ -21,7 +21,8 @@ function loadApp() {
     const config = {
         httpport: 3001,
         'notify:address': '127.0.0.1',
-        'notify:port': 39500
+        'notify:port': 39500,
+        discover: JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config.json'), 'utf8')).discover
     };
     let notificationError;
     let autoRespond = true;
@@ -34,6 +35,9 @@ function loadApp() {
         constructor(pin, direction) {
             this.pin = pin;
             this.value = direction === 'high' ? 1 : 0;
+            if (pin === 537 && options.gateStartupReadback !== undefined) {
+                this.value = options.gateStartupReadback;
+            }
             gpios.set(pin, this);
         }
         readSync() {
@@ -139,6 +143,7 @@ function loadApp() {
         get timers() { return timers.filter(timer => timer.delay === 1500); },
         fireplace: gpios.get(535),
         garage: gpios.get(536),
+        gate: gpios.get(537),
         setNotificationError(error) { notificationError = error; },
         setAutoRespond(value) { autoRespond = value; },
         retry(device) {
@@ -175,14 +180,19 @@ function loadApp() {
             callback(error);
         },
         command(device, command) {
-            let ended = false;
+            const response = {
+                statusCode: 200,
+                ended: false,
+                status(code) { this.statusCode = code; return this; },
+                send(body) { this.body = body; this.ended = true; },
+                end() { this.ended = true; }
+            };
             routes.get('/:device/:command')({
                 params: { device, command },
                 ip: '127.0.0.1'
-            }, {
-                end() { ended = true; }
-            });
-            assert.equal(ended, true);
+            }, response);
+            assert.equal(response.ended, true);
+            return response;
         }
     };
 }
@@ -219,43 +229,53 @@ test('fireplace failures do not update confirmed state or send success notificat
     assert.deepEqual(app.events, []);
 });
 
-test('garage repeats report confirmed state without restarting or shortening the pulse', () => {
-    const app = loadApp();
-    app.command('garagedoor', 'on');
-    app.command('garagedoor', 'on');
-    app.command('garagedoor', 'off');
-    assert.equal(app.timers.length, 1);
-    assert.equal(app.timers[0].delay, 1500);
-    assert.equal(app.garage.value, 0);
-    app.timers[0].callback();
-    app.command('garagedoor', 'off');
-    assert.deepEqual(app.events, [
-        ['write', 536, 0], ['read', 536, 0], ['read', 536, 0], ['notify', 'garagedoor', 'ON'],
-        ['read', 536, 0], ['read', 536, 0], ['notify', 'garagedoor', 'ON'],
-        ['read', 536, 0], ['read', 536, 0], ['notify', 'garagedoor', 'ON'],
-        ['write', 536, 1], ['read', 536, 1], ['read', 536, 1], ['notify', 'garagedoor', 'OFF'],
-        ['read', 536, 1], ['read', 536, 1], ['notify', 'garagedoor', 'OFF']
-    ]);
-    assert.equal(app.context.relaystategarage, 1);
-    assert.equal(app.context.garagePulseTimer, null);
-    app.command('garagedoor', 'on');
-    assert.equal(app.timers.length, 2);
+test('garage repeats report confirmed state without restarting or shortening either relay pulse', () => {
+    for (const [device, gpio, pin, tracked] of [
+        ['garagedoor', 'garage', 536, 'relaystategarage'],
+        ['garagegate', 'gate', 537, 'relaystategaragegate']
+    ]) {
+        const app = loadApp();
+        app.command(device, 'on');
+        app.command(device, 'on');
+        app.command(device, 'off');
+        assert.equal(app.timers.length, 1);
+        assert.equal(app.timers[0].delay, 1500);
+        assert.equal(app[gpio].value, 0);
+        app.timers[0].callback();
+        app.command(device, 'off');
+        assert.deepEqual(app.events, [
+            ['write', pin, 0], ['read', pin, 0], ['read', pin, 0], ['notify', device, 'ON'],
+            ['read', pin, 0], ['read', pin, 0], ['notify', device, 'ON'],
+            ['read', pin, 0], ['read', pin, 0], ['notify', device, 'ON'],
+            ['write', pin, 1], ['read', pin, 1], ['read', pin, 1], ['notify', device, 'OFF'],
+            ['read', pin, 1], ['read', pin, 1], ['notify', device, 'OFF']
+        ]);
+        assert.equal(app.context[tracked], 1);
+        assert.equal(app.context.garagePulseTimers[device], null);
+        app.command(device, 'on');
+        assert.equal(app.timers.length, 2);
+    }
 });
 
 test('garage verification failures never announce an unconfirmed ON state', () => {
-    for (const fault of ['writeError', 'readError', 'ignoreWrites']) {
-        const app = loadApp();
-        app.garage[fault] = fault === 'ignoreWrites' ? true : new Error(fault);
-        assert.throws(() => app.command('garagedoor', 'on'), /Error|verification failed/);
-        assert.equal(app.context.relaystategarage, 1);
-        assert.deepEqual(app.messages, []);
-        assert.equal(app.timers.length, 1);
-        assert.throws(() => app.command('garagedoor', 'on'), /Error|verification failed/);
-        assert.equal(app.timers.length, 1);
-        app.garage[fault] = undefined;
-        app.timers[0].callback();
-        assert.equal(app.garage.value, 1);
-        assert.deepEqual(app.messages, [{ device: 'garagedoor', command: 'OFF' }]);
+    for (const [device, gpio, tracked] of [
+        ['garagedoor', 'garage', 'relaystategarage'],
+        ['garagegate', 'gate', 'relaystategaragegate']
+    ]) {
+        for (const fault of ['writeError', 'readError', 'ignoreWrites']) {
+            const app = loadApp();
+            app[gpio][fault] = fault === 'ignoreWrites' ? true : new Error(fault);
+            assert.throws(() => app.command(device, 'on'), /Error|verification failed/);
+            assert.equal(app.context[tracked], 1);
+            assert.deepEqual(app.messages, []);
+            assert.equal(app.timers.length, 1);
+            assert.throws(() => app.command(device, 'on'), /Error|verification failed/);
+            assert.equal(app.timers.length, 1);
+            app[gpio][fault] = undefined;
+            app.timers[0].callback();
+            assert.equal(app[gpio].value, 1);
+            assert.deepEqual(app.messages, [{ device, command: 'OFF' }]);
+        }
     }
 });
 
@@ -274,25 +294,32 @@ test('notification setup failures do not fail garage commands or delay their rel
 });
 
 test('garage release failures never announce an unconfirmed OFF state', () => {
-    for (const fault of ['writeError', 'readError', 'ignoreWrites']) {
-        const app = loadApp();
-        app.command('garagedoor', 'on');
-        app.garage[fault] = fault === 'ignoreWrites' ? true : new Error(fault);
-        assert.throws(() => app.timers[0].callback(), /Error|verification failed/);
-        assert.equal(app.context.relaystategarage, 0);
-        assert.deepEqual(app.messages, [{ device: 'garagedoor', command: 'ON' }]);
+    for (const [device, gpio, tracked] of [
+        ['garagedoor', 'garage', 'relaystategarage'],
+        ['garagegate', 'gate', 'relaystategaragegate']
+    ]) {
+        for (const fault of ['writeError', 'readError', 'ignoreWrites']) {
+            const app = loadApp();
+            app.command(device, 'on');
+            app[gpio][fault] = fault === 'ignoreWrites' ? true : new Error(fault);
+            assert.throws(() => app.timers[0].callback(), /Error|verification failed/);
+            assert.equal(app.context[tracked], 0);
+            assert.deepEqual(app.messages, [{ device, command: 'ON' }]);
+        }
     }
 });
 
-test('startup publishes both confirmed OFF states after reading both outputs', () => {
+test('startup publishes all confirmed OFF states after reading all outputs', () => {
     const app = loadApp();
     assert.deepEqual(app.startupMessages, [
         { device: 'fireplace', command: 'OFF' },
-        { device: 'garagedoor', command: 'OFF' }
+        { device: 'garagedoor', command: 'OFF' },
+        { device: 'garagegate', command: 'OFF' }
     ]);
-    assert.deepEqual(app.startupEvents.slice(-4), [
+    assert.deepEqual(app.startupEvents.slice(-6), [
         ['read', 535, 1], ['notify', 'fireplace', 'OFF'],
-        ['read', 536, 1], ['notify', 'garagedoor', 'OFF']
+        ['read', 536, 1], ['notify', 'garagedoor', 'OFF'],
+        ['read', 537, 1], ['notify', 'garagegate', 'OFF']
     ]);
     assert.equal(app.startupEvents.some(event => event[0] === 'write'), false);
 });
@@ -300,7 +327,8 @@ test('startup publishes both confirmed OFF states after reading both outputs', (
 test('status refresh reports observed output, logs mismatches, and preserves tracked state', () => {
     for (const [device, gpio, tracked, physical, field] of [
         ['fireplace', 'fireplace', 'relaystate', 'physicalrelay', 'physicalrelay'],
-        ['garagedoor', 'garage', 'relaystategarage', 'physicalrelaygarage', 'physicalrelaygarage']
+        ['garagedoor', 'garage', 'relaystategarage', 'physicalrelaygarage', 'physicalrelaygarage'],
+        ['garagegate', 'gate', 'relaystategaragegate', 'physicalrelaygaragegate', 'physicalrelaygaragegate']
     ]) {
         for (const value of [0, 1]) {
             const app = loadApp();
@@ -332,11 +360,15 @@ test('garage status does not depend on the fireplace relay object', () => {
 });
 
 test('status refresh does not announce a state when GPIO is absent, invalid, or unreadable', () => {
-    for (const device of ['fireplace', 'garagedoor']) {
+    for (const [device, property, variable] of [
+        ['fireplace', 'fireplace', 'relay'],
+        ['garagedoor', 'garage', 'relaygarage'],
+        ['garagegate', 'gate', 'relaygaragegate']
+    ]) {
         for (const fault of ['absent', 'invalid', 'unreadable']) {
             const app = loadApp();
-            const gpio = device === 'fireplace' ? app.fireplace : app.garage;
-            if (fault === 'absent') app.context[device === 'fireplace' ? 'relay' : 'relaygarage'] = undefined;
+            const gpio = app[property];
+            if (fault === 'absent') app.context[variable] = undefined;
             if (fault === 'invalid') gpio.value = 2;
             if (fault === 'unreadable') gpio.readError = new Error('Read failed');
             assert.throws(() => app.status(device), /Relay not initialized|Invalid relay readback|Read failed/);
@@ -356,7 +388,8 @@ test('subscription waits for saving and then snapshots current outputs to the ne
     assert.equal(response.statusCode, 200);
     assert.deepEqual(app.messages, [
         { device: 'fireplace', command: 'ON' },
-        { device: 'garagedoor', command: 'OFF' }
+        { device: 'garagedoor', command: 'OFF' },
+        { device: 'garagegate', command: 'OFF' }
     ]);
     assert.ok(app.requests.every(request => request.host === '127.0.0.2' && request.port === '39501'));
     assert.equal(app.context.relaystate, 1);
@@ -366,16 +399,17 @@ test('subscription waits for saving and then snapshots current outputs to the ne
 test('subscription snapshots do not restart or shorten an active garage pulse', () => {
     const app = loadApp();
     app.command('garagedoor', 'on');
-    const timer = app.context.garagePulseTimer;
+    const timer = app.context.garagePulseTimers.garagedoor;
     const response = app.subscribe('127.0.0.1:39500');
     app.completeSave();
     assert.equal(response.ended, true);
-    assert.equal(app.context.garagePulseTimer, timer);
+    assert.equal(app.context.garagePulseTimers.garagedoor, timer);
     assert.equal(app.timers.length, 1);
     assert.equal(app.garage.value, 0);
-    assert.deepEqual(app.messages.slice(-2), [
+    assert.deepEqual(app.messages.slice(-3), [
         { device: 'fireplace', command: 'OFF' },
-        { device: 'garagedoor', command: 'ON' }
+        { device: 'garagedoor', command: 'ON' },
+        { device: 'garagegate', command: 'OFF' }
     ]);
     timer.callback();
     assert.equal(app.garage.value, 1);
@@ -432,7 +466,7 @@ test('garage pulses finish while another notification is waiting for its respons
     assert.equal(app.outgoing.length, 1);
     app.timers[0].callback();
     assert.equal(app.garage.value, 1);
-    assert.equal(app.context.garagePulseTimer, null);
+    assert.equal(app.context.garagePulseTimers.garagedoor, null);
     app.outgoing[0].respond(200);
     assert.deepEqual(app.messages, [
         { device: 'fireplace', command: 'ON' },
@@ -444,19 +478,24 @@ test('garage pulses finish while another notification is waiting for its respons
 });
 
 test('notification retries re-read GPIO instead of replaying an obsolete ON payload', () => {
-    const app = loadApp();
-    app.setAutoRespond(false);
-    app.command('garagedoor', 'on');
-    app.outgoing[0].fail(new Error('Connection refused'));
-    assert.equal(app.retry('garagedoor').delay, 5000);
-    app.garage.value = 1;
-    app.retry('garagedoor').callback();
-    assert.deepEqual(app.messages, [
-        { device: 'garagedoor', command: 'ON' },
-        { device: 'garagedoor', command: 'OFF' }
-    ]);
-    assert.equal(app.context.relaystategarage, 0);
-    assert.deepEqual(app.events.filter(event => event[0] === 'write'), [['write', 536, 0]]);
+    for (const [device, gpio, pin, tracked] of [
+        ['garagedoor', 'garage', 536, 'relaystategarage'],
+        ['garagegate', 'gate', 537, 'relaystategaragegate']
+    ]) {
+        const app = loadApp();
+        app.setAutoRespond(false);
+        app.command(device, 'on');
+        app.outgoing[0].fail(new Error('Connection refused'));
+        assert.equal(app.retry(device).delay, 5000);
+        app[gpio].value = 1;
+        app.retry(device).callback();
+        assert.deepEqual(app.messages, [
+            { device, command: 'ON' },
+            { device, command: 'OFF' }
+        ]);
+        assert.equal(app.context[tracked], 0);
+        assert.deepEqual(app.events.filter(event => event[0] === 'write'), [['write', pin, 0]]);
+    }
 });
 
 test('unreadable GPIO blocks retry payloads without replaying the previous state', () => {
@@ -532,9 +571,10 @@ test('retries stop after the approved delays and periodic reconciliation recover
     const periodic = app.intervals.find(timer => timer.delay === 300000);
     assert.ok(periodic);
     periodic.callback();
-    assert.deepEqual(app.messages.slice(-2), [
+    assert.deepEqual(app.messages.slice(-3), [
         { device: 'fireplace', command: 'ON' },
-        { device: 'garagedoor', command: 'ON' }
+        { device: 'garagedoor', command: 'ON' },
+        { device: 'garagegate', command: 'OFF' }
     ]);
     assert.deepEqual(app.events.filter(event => event[0] === 'write'), [['write', 535, 0]]);
 });
@@ -578,7 +618,8 @@ test('periodic snapshot errors are logged and do not prevent a later reconciliat
     periodic.callback();
     assert.deepEqual(app.messages, [
         { device: 'fireplace', command: 'OFF' },
-        { device: 'garagedoor', command: 'OFF' }
+        { device: 'garagedoor', command: 'OFF' },
+        { device: 'garagegate', command: 'OFF' }
     ]);
 });
 
@@ -593,4 +634,103 @@ test('temperature and discovery notifications retain their existing payloads and
         request.method === 'NOTIFY' && request.path === '/notify' &&
         request.headers.device === 'fireplace'
     ));
+});
+
+test('garagegate must initialize OFF and rejects unknown commands without operating a relay', () => {
+    assert.throws(() => loadApp({ gateStartupReadback: 0 }), /all relays must be OFF/);
+    const app = loadApp();
+    assert.equal(app.gate.value, 1);
+    const response = app.command('garagegate', 'invalid');
+    assert.equal(response.statusCode, 404);
+    assert.equal(response.body, 'Command not found');
+    assert.deepEqual(app.events, []);
+});
+
+test('garagegate and garagedoor maintain independent pulse timers and state snapshots', () => {
+    const app = loadApp();
+    app.command('garagegate', 'on');
+    const gateTimer = app.context.garagePulseTimers.garagegate;
+    app.command('garagedoor', 'on');
+    const doorTimer = app.context.garagePulseTimers.garagedoor;
+    app.command('garagegate', 'on');
+    app.command('garagedoor', 'on');
+    assert.equal(app.timers.length, 2);
+    assert.notEqual(gateTimer, doorTimer);
+    const response = app.subscribe('127.0.0.1:39500');
+    app.completeSave();
+    assert.equal(response.ended, true);
+    assert.deepEqual(app.messages.slice(-3), [
+        { device: 'fireplace', command: 'OFF' },
+        { device: 'garagedoor', command: 'ON' },
+        { device: 'garagegate', command: 'ON' }
+    ]);
+    assert.equal(app.context.garagePulseTimers.garagegate, gateTimer);
+    assert.equal(app.context.garagePulseTimers.garagedoor, doorTimer);
+    gateTimer.callback();
+    assert.equal(app.gate.value, 1);
+    assert.equal(app.garage.value, 0);
+    assert.equal(app.context.relaystategaragegate, 1);
+    assert.equal(app.context.relaystategarage, 0);
+    app.command('garagegate', 'on');
+    const nextGateTimer = app.context.garagePulseTimers.garagegate;
+    doorTimer.callback();
+    assert.equal(app.garage.value, 1);
+    assert.equal(app.gate.value, 0);
+    assert.equal(app.context.garagePulseTimers.garagedoor, null);
+    assert.equal(app.context.garagePulseTimers.garagegate, nextGateTimer);
+    nextGateTimer.callback();
+    assert.equal(app.gate.value, 1);
+    assert.ok(app.timers.every(timer => timer.delay === 1500));
+    assert.deepEqual(app.events.filter(event => event[0] === 'write'), [
+        ['write', 537, 0], ['write', 536, 0], ['write', 537, 1],
+        ['write', 537, 0], ['write', 536, 1], ['write', 537, 1]
+    ]);
+});
+
+test('both garage relays release on time even while Hubitat notification delivery is stalled', () => {
+    const app = loadApp();
+    app.setAutoRespond(false);
+    app.command('garagegate', 'on');
+    app.command('garagedoor', 'on');
+    assert.equal(app.outgoing.length, 1);
+    app.context.garagePulseTimers.garagegate.callback();
+    app.context.garagePulseTimers.garagedoor.callback();
+    assert.equal(app.gate.value, 1);
+    assert.equal(app.garage.value, 1);
+    assert.equal(app.context.garagePulseTimers.garagegate, null);
+    assert.equal(app.context.garagePulseTimers.garagedoor, null);
+    app.outgoing[0].respond(200);
+    app.outgoing[1].respond(200);
+    app.outgoing[2].respond(200);
+    assert.deepEqual(app.messages, [
+        { device: 'garagegate', command: 'ON' },
+        { device: 'garagedoor', command: 'OFF' },
+        { device: 'garagegate', command: 'OFF' }
+    ]);
+    assert.equal(app.context.notificationQueue.size, 0);
+});
+
+test('periodic reconciliation includes garagegate readback without changing its tracked state', () => {
+    const app = loadApp();
+    app.gate.value = 0;
+    app.intervals.find(timer => timer.delay === 300000).callback();
+    assert.deepEqual(app.messages, [
+        { device: 'fireplace', command: 'OFF' },
+        { device: 'garagedoor', command: 'OFF' },
+        { device: 'garagegate', command: 'ON' }
+    ]);
+    assert.equal(app.context.relaystategaragegate, 1);
+    assert.equal(app.events.some(event => event[0] === 'write'), false);
+});
+
+test('discovery advertises garagegate with the same switch driver as garagedoor', () => {
+    const app = loadApp();
+    app.context.devicesDiscover();
+    const discovery = app.messages[0];
+    assert.equal(discovery.type, 'discover');
+    const door = discovery.devices.find(device => device.name === 'garagedoor');
+    const gates = discovery.devices.filter(device => device.name === 'garagegate');
+    assert.equal(gates.length, 1);
+    assert.equal(gates[0].type, door.type);
+    assert.equal(gates[0].devicetypename, door.devicetypename);
 });

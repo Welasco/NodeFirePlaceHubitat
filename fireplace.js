@@ -41,9 +41,11 @@ var relaystate = 1;
 var oldswitchstate = 0;
 var newswitchstate = 0;
 var relaystategarage = 1;
-var garagePulseTimer = null;
+var relaystategaragegate = 1;
+var garagePulseTimers = { garagedoor: null, garagegate: null };
 var physicalrelay = 1;
 var physicalrelaygarage = 1;
+var physicalrelaygaragegate = 1;
 var miliolddate = new Date().getTime();
 var milinewdate = new Date().getTime();
 var firstexecution = true;
@@ -105,6 +107,24 @@ api.get('/:device', function (req, res) {
             res.send(garagedoorstatus);
             break;
 
+        case "garagegate":
+            var garagegatestatus = {
+                garagegate: "",
+                physicalrelaygaragegate: ""
+            }
+            physicalrelaygaragegate = readrelaystate("garagegate",relaygaragegate,relaystategaragegate);
+            if (physicalrelaygaragegate == 1) {
+                garagegatestatus.garagegate = "OFF"
+            }
+            else{
+                garagegatestatus.garagegate = "ON"
+            }
+            garagegatestatus.physicalrelaygaragegate = garagegatestatus.garagegate;
+            sendSmartThingMsg("garagegate",garagegatestatus.garagegate);
+            logger("HTTP","Request at /api/garagegate");
+            res.send(garagegatestatus);
+            break;
+
         case "fireplacetemperature":
             var fireplacetemperature = {
                 vartemperatureF: "",
@@ -164,26 +184,27 @@ api.get('/:device/:command', function (req, res) {
             }
             break;
         case "garagedoor":
+        case "garagegate":
             switch (command) {
                 case "on":
-                    if (garagePulseTimer === null) {
-                        relaycontrolgarage();
-                        logger("HTTP","Request at /api/garagedoor/on");
+                    if (garagePulseTimers[device] === null) {
+                        relaycontrolgarage(device);
+                        logger("HTTP","Request at /api/"+device+"/on");
                     }
                     else{
-                        reportgaragestate(0);
-                        logger("HTTP","Relay GarageDoor already ON");
+                        reportgaragestate(0,device);
+                        logger("HTTP","Relay " + device + " already ON");
                     }
                     res.end();
                     break;
 
                 case "off":
-                    reportgaragestate(garagePulseTimer === null ? 1 : 0);
-                    if (relaystategarage == 0) {
-                        logger("HTTP","Request at /api/garagedoor/off");
+                    reportgaragestate(garagePulseTimers[device] === null ? 1 : 0,device);
+                    if (garagePulseTimers[device] !== null) {
+                        logger("HTTP","Request at /api/"+device+"/off");
                     }
                     else{
-                        logger("HTTP","Relay GarageDoor already OFF");
+                        logger("HTTP","Relay " + device + " already OFF");
                     }
                     res.end();
                     break;
@@ -333,12 +354,14 @@ logger("GPIO","Using " + gpioChips[0] + " with sysfs base " + gpioBase);
 // 'high' initializes these active-low relays OFF without an initial LOW pulse.
 var relay = new Gpio(gpioBase + 23, 'high');
 var relaygarage = new Gpio(gpioBase + 24, 'high');
+var relaygaragegate = new Gpio(gpioBase + 25, 'high');
 relaystate = relay.readSync();
 relaystategarage = relaygarage.readSync();
-if (relaystate !== 1 || relaystategarage !== 1) {
-    throw new Error('Relay initialization failed: both relays must be OFF before starting the HTTP server');
+relaystategaragegate = relaygaragegate.readSync();
+if (relaystate !== 1 || relaystategarage !== 1 || relaystategaragegate !== 1) {
+    throw new Error('Relay initialization failed: all relays must be OFF before starting the HTTP server');
 }
-logger("GPIO","Both relays initialized OFF");
+logger("GPIO","All relays initialized OFF");
 
 var pushButton = new Gpio(gpioBase + 4, 'in', 'both'); //BCM GPIO4, monitoring both edges
 
@@ -450,6 +473,9 @@ function sendnotification(entry,callback) {
         } else if (entry.device === 'garagedoor') {
             physicalrelaygarage = readrelaystate("garagedoor",relaygarage,relaystategarage);
             data = JSON.stringify({device: entry.device, command: physicalrelaygarage == 0 ? "ON" : "OFF"});
+        } else if (entry.device === 'garagegate') {
+            physicalrelaygaragegate = readrelaystate("garagegate",relaygaragegate,relaystategaragegate);
+            data = JSON.stringify({device: entry.device, command: physicalrelaygaragegate == 0 ? "ON" : "OFF"});
         }
         var opts = {
             method: 'NOTIFY',
@@ -505,8 +531,10 @@ function readrelaystate(device,gpio,trackedstate) {
 function reportrelaystates() {
     physicalrelay = readrelaystate("fireplace",relay,relaystate);
     physicalrelaygarage = readrelaystate("garagedoor",relaygarage,relaystategarage);
+    physicalrelaygaragegate = readrelaystate("garagegate",relaygaragegate,relaystategaragegate);
     sendSmartThingMsg("fireplace",physicalrelay == 0 ? "ON" : "OFF");
     sendSmartThingMsg("garagedoor",physicalrelaygarage == 0 ? "ON" : "OFF");
+    sendSmartThingMsg("garagegate",physicalrelaygaragegate == 0 ? "ON" : "OFF");
 }
 
 reportrelaystates();
@@ -603,26 +631,42 @@ function relaycontrol(requestedstate){
     sendSmartThingMsg("fireplace",relaystate == 0 ? "ON" : "OFF");
 };
 
-function reportgaragestate(expectedstate) {
-    physicalrelaygarage = relaygarage.readSync();
-    if (physicalrelaygarage !== expectedstate) {
-        throw new Error('Garage relay verification failed: expected ' + expectedstate + ', read ' + physicalrelaygarage);
-    }
-    relaystategarage = physicalrelaygarage;
-    sendSmartThingMsg("garagedoor",relaystategarage == 0 ? "ON" : "OFF");
+function getgaragerelay(device) {
+    if (device === "garagedoor") return relaygarage;
+    if (device === "garagegate") return relaygaragegate;
+    throw new Error('Unknown garage relay: ' + device);
 }
 
-function relaycontrolgarage() {
-    logger("RELALAYCONTROLGARAGE","Changing Relay State to ON: " + relaystategarage);
+function reportgaragestate(expectedstate,device) {
+    var state = getgaragerelay(device).readSync();
+    if (device === "garagedoor") {
+        physicalrelaygarage = state;
+    } else {
+        physicalrelaygaragegate = state;
+    }
+    if (state !== expectedstate) {
+        throw new Error('Garage relay verification failed for ' + device + ': expected ' + expectedstate + ', read ' + state);
+    }
+    if (device === "garagedoor") {
+        relaystategarage = state;
+    } else {
+        relaystategaragegate = state;
+    }
+    sendSmartThingMsg(device,state == 0 ? "ON" : "OFF");
+}
+
+function relaycontrolgarage(device) {
+    var gpio = getgaragerelay(device);
+    logger("RELALAYCONTROLGARAGE","Changing " + device + " Relay State to ON");
     // Keep release scheduled even if the ON write, readback, or notification fails.
-    garagePulseTimer = setTimeout(function() {
-        logger("RELALAYCONTROLGARAGE","Changing Relay State to OFF: " + relaystategarage);
-        relaygarage.writeSync(1);
-        reportgaragestate(1);
-        garagePulseTimer = null;
+    garagePulseTimers[device] = setTimeout(function() {
+        logger("RELALAYCONTROLGARAGE","Changing " + device + " Relay State to OFF");
+        gpio.writeSync(1);
+        reportgaragestate(1,device);
+        garagePulseTimers[device] = null;
      }, 1500);
-    relaygarage.writeSync(0);
-    reportgaragestate(0);
+    gpio.writeSync(0);
+    reportgaragestate(0,device);
 }
 
 // ####################################
