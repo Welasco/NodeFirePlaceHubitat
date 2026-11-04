@@ -664,7 +664,7 @@ function relaycontrolgarage(device) {
         gpio.writeSync(1);
         reportgaragestate(1,device);
         garagePulseTimers[device] = null;
-     }, 1500);
+     }, 4500);
     gpio.writeSync(0);
     reportgaragestate(0,device);
 }

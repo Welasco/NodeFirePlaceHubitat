@@ -140,7 +140,7 @@ function loadApp(options = {}) {
     return {
         context, events, messages, requests, outgoing, intervals, logs, startupMessages, startupEvents,
         allTimers: timers,
-        get timers() { return timers.filter(timer => timer.delay === 1500); },
+        get timers() { return timers.filter(timer => timer.delay === 4500); },
         fireplace: gpios.get(535),
         garage: gpios.get(536),
         gate: gpios.get(537),
@@ -239,7 +239,7 @@ test('garage repeats report confirmed state without restarting or shortening eit
         app.command(device, 'on');
         app.command(device, 'off');
         assert.equal(app.timers.length, 1);
-        assert.equal(app.timers[0].delay, 1500);
+        assert.equal(app.timers[0].delay, 4500);
         assert.equal(app[gpio].value, 0);
         app.timers[0].callback();
         app.command(device, 'off');
@@ -680,7 +680,7 @@ test('garagegate and garagedoor maintain independent pulse timers and state snap
     assert.equal(app.context.garagePulseTimers.garagegate, nextGateTimer);
     nextGateTimer.callback();
     assert.equal(app.gate.value, 1);
-    assert.ok(app.timers.every(timer => timer.delay === 1500));
+    assert.ok(app.timers.every(timer => timer.delay === 4500));
     assert.deepEqual(app.events.filter(event => event[0] === 'write'), [
         ['write', 537, 0], ['write', 536, 0], ['write', 537, 1],
         ['write', 537, 0], ['write', 536, 1], ['write', 537, 1]
