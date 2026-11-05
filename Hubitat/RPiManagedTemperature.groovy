@@ -26,7 +26,7 @@ def Rpiparse(String description){
 
 def refresh(){
     parent.writeLog("Rpiparse Device Type - Sending command")
-    sendRaspberryCommand("${device.getName()}")
+    sendRaspberryCommand("${parent.getRaspberryDeviceName(device)}")
 }
 
 def sendRaspberryCommand(String command) {

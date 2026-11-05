@@ -1,15 +1,13 @@
 #!/usr/bin/env node
-// Loading Dependencies
+// Dependencies and configuration
 var http = require("http");
-var https = require('https');
 var express = require("express");
 var app = express();
 var nconf = require('nconf');
 nconf.file({ file: './config.json' });
-//var config = require('./config.js');
 var fs = require('fs');
-var Gpio = require('onoff').Gpio; //include onoff to interact with the GPIO
-var sensor = require('node-dht-sensor');
+var Gpio = require('onoff').Gpio;
+var temperatureSensor = require('node-dht-sensor');
 var log4js = require("log4js");
 
 log4js.configure({
@@ -17,383 +15,306 @@ log4js.configure({
     categories: { default: { appenders: ["fireplace"], level: "debug" } }
   });
 
-const wlogger = log4js.getLogger("fireplace");
+const fileLogger = log4js.getLogger("fireplace");
 
-////////////////////////////////////////
-// Logger Function
-////////////////////////////////////////
-var logger = function(mod,str) {
-    console.log("[%s] [%s] %s", new Date().toISOString(), mod, str);
-
-    // log4js.configure({
-    //   appenders: { fireplace: { type: "file", filename: "fireplace.log" } },
-    //   categories: { default: { appenders: ["fireplace"], level: "debug" } }
-    // });
-
-    // const wlogger = log4js.getLogger("fireplace");
-    wlogger.info("[%s] %s", mod, str);
+// Write a timestamped message to the console and application log.
+var logMessage = function(module,message) {
+    console.log("[%s] [%s] %s", new Date().toISOString(), module, message);
+    fileLogger.info("[%s] %s", module, message);
 }
 
-logger("Modules","Modules loaded");
+logMessage("Modules","Modules loaded");
 
-var httpport = nconf.get('httpport');
-var relaystate = 1;
-var oldswitchstate = 0;
-var newswitchstate = 0;
-var relaystategarage = 1;
-var relaystategaragegate = 1;
-var garagePulseTimers = { garagedoor: null, garagegate: null };
-var physicalrelay = 1;
-var physicalrelaygarage = 1;
-var physicalrelaygaragegate = 1;
-var miliolddate = new Date().getTime();
-var milinewdate = new Date().getTime();
-var firstexecution = true;
+var httpPort = nconf.get('httpport');
+var relayReportIntervalMs = nconf.get('relayReportIntervalMs');
+var deviceRegistry = new Map();
 
+// Log invalid configuration and stop startup before GPIO initialization.
+function throwConfigurationError(message) {
+    logMessage("Config","Configuration error: " + message);
+    throw new Error('Configuration error: ' + message);
+}
 
-//////////////////////////////////////////////////////////////////
-// Creating Endpoints
-// Those Endpoints will receive a HTTP GET Request
-// Execute the associated Method to make the following:
-//  "/" - Used to check if the Fireplace is running
-//  "/api/fireplace" - Used to turn on and off the fireplace
-//////////////////////////////////////////////////////////////////
+// Check that a value fits the positive interval range supported by Node timers.
+function isValidTimerInterval(value) {
+    return Number.isSafeInteger(value) && value > 0 && value <= 2147483647;
+}
 
+// Validate configured devices and create their independent runtime state.
+function loadConfiguredDevices() {
+    var discovery = nconf.get('discover');
+    var assignedPins = new Set();
+    if (!Number.isSafeInteger(httpPort) || httpPort < 1 || httpPort > 65535) {
+        throwConfigurationError('httpport must be an integer from 1 to 65535');
+    }
+    if (!isValidTimerInterval(relayReportIntervalMs)) {
+        throwConfigurationError('relayReportIntervalMs must be a positive timer interval');
+    }
+    if (!discovery || discovery.type !== 'discover' || !Array.isArray(discovery.devices)) {
+        throwConfigurationError('discover must contain type "discover" and a devices array');
+    }
+
+    // Reject invalid BCM pins and conflicting relay, sensor, or input assignments.
+    function reserveGpioPin(pin,name) {
+        if (!Number.isSafeInteger(pin) || pin < 0 || pin > 27) {
+            throwConfigurationError(name + ' must use a BCM GPIO number from 0 to 27');
+        }
+        if (assignedPins.has(pin)) {
+            throwConfigurationError('BCM GPIO' + pin + ' is assigned more than once (' + name + ')');
+        }
+        assignedPins.add(pin);
+    }
+
+    discovery.devices.forEach(function (config) {
+        if (!config || typeof config.name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(config.name)) {
+            throwConfigurationError('each device needs a URL-safe name using letters, numbers, "_" or "-"');
+        }
+        if (deviceRegistry.has(config.name)) {
+            throwConfigurationError('duplicate device name: ' + config.name);
+        }
+        if (typeof config.label !== 'string' || !config.label.trim() ||
+            typeof config.devicetypename !== 'string' || !config.devicetypename.trim()) {
+            throwConfigurationError(config.name + ' needs a label and devicetypename');
+        }
+        reserveGpioPin(config.gpio,config.name);
+        if (config.type === 'switch') {
+            if (typeof config.activeLow !== 'boolean' ||
+                (config.mode !== 'maintained' && config.mode !== 'momentary')) {
+                throwConfigurationError(config.name + ' needs activeLow and mode "maintained" or "momentary"');
+            }
+            if (config.mode === 'momentary' && !isValidTimerInterval(config.pulseMs)) {
+                throwConfigurationError(config.name + ' needs a positive pulseMs timer interval');
+            }
+            if (config.manualInput !== undefined) {
+                var input = config.manualInput;
+                if (config.mode !== 'maintained' || !input || typeof input !== 'object') {
+                    throwConfigurationError(config.name + ' manualInput is supported only on maintained relays');
+                }
+                reserveGpioPin(input.gpio,config.name + ' manualInput');
+                if (typeof input.activeLow !== 'boolean' || typeof input.controlEnabled !== 'boolean' ||
+                    !isValidTimerInterval(input.checkIntervalMs) || !isValidTimerInterval(input.checkCount)) {
+                    throwConfigurationError(config.name + ' manualInput needs activeLow, controlEnabled, checkIntervalMs and checkCount');
+                }
+            }
+        }
+        else if (config.type === 'temperature') {
+            if ((config.sensorType !== 11 && config.sensorType !== 22) || !isValidTimerInterval(config.pollIntervalMs)) {
+                throwConfigurationError(config.name + ' needs sensorType 11 or 22 and a positive pollIntervalMs');
+            }
+            if (config.manualInput !== undefined) {
+                throwConfigurationError(config.name + ' manualInput is supported only on maintained relays');
+            }
+        }
+        else{
+            throwConfigurationError('unsupported device type for ' + config.name + ': ' + config.type);
+        }
+        deviceRegistry.set(config.name, {
+            config: config,
+            relayGpio: null,
+            confirmedRelayState: config.activeLow ? 1 : 0,
+            observedRelayState: config.activeLow ? 1 : 0,
+            pulseTimer: null,
+            manualInputGpio: null,
+            confirmedInputState: null,
+            candidateInputState: null,
+            inputCheckTimer: null
+        });
+    });
+}
+
+loadConfiguredDevices();
+
+// Find a configured relay, rejecting missing devices and temperature sensors.
+function getRelayDevice(deviceName) {
+    var item = deviceRegistry.get(deviceName);
+    if (!item || item.config.type !== 'switch') {
+        throw new Error('Unknown relay: ' + deviceName);
+    }
+    return item;
+}
+
+// Convert logical ON/OFF to the output level required by this relay's polarity.
+function getRelayOutputLevel(item,on) {
+    var onLevel = item.config.activeLow ? 0 : 1;
+    return on ? onLevel : 1 - onLevel;
+}
+
+// Convert a verified GPIO level to the ON/OFF label used by HTTP and Hubitat.
+function getRelayStateLabel(item,state) {
+    return state === getRelayOutputLevel(item,true) ? "ON" : "OFF";
+}
+
+// HTTP endpoints
 var api = express.Router();
 app.use('/api',api);
-// Used only to check if NodeJS is running
-app.get("/", function (req, res) {
+
+// Report HTTP availability without reading or operating any hardware.
+app.get("/", function handleHealthRequest(req, res) {
     res.send("<html><body><h1>FirePlace ON</h1></body></html>");
 });
 
-api.get('/:device', function (req, res) {
-    let device = req.params['device']
+// Read a configured relay or sensor and report its current state to Hubitat.
+api.get('/:device', function handleDeviceStatusRequest(req, res) {
+    let deviceName = req.params['device'];
     let ip = req.ip;
-    logger("/api/"+device,"Received request at: " + device + " Source IP: "+ip);
-    switch (device) {
-        case "fireplace":
-            var fireplacestatus = {
-                fireplace: "",
-                physicalrelay: ""
+    logMessage("/api/"+deviceName,"Received request at: " + deviceName + " Source IP: "+ip);
+    var item = deviceRegistry.get(deviceName);
+    if (!item) {
+        res.status(404).send("Device not found");
+        return;
+    }
+    if (item.config.type === 'switch') {
+        item.observedRelayState = readRelayOutput(deviceName,item.relayGpio,item.confirmedRelayState);
+        var status = {};
+        status[deviceName] = getRelayStateLabel(item,item.observedRelayState);
+        status.physicalrelay = status[deviceName];
+        queueDeviceStateNotification(deviceName,status[deviceName]);
+        logMessage("HTTP","Request at /api/" + deviceName);
+        res.send(status);
+    }
+    else{
+        readTemperature(deviceName,function (err, temperature) {
+            if (err) {
+                res.status(500).send("Error: " + err);
+                return;
             }
-            physicalrelay = readrelaystate("fireplace",relay,relaystate);
-            if (physicalrelay == 1) {
-                fireplacestatus.fireplace = "OFF"
-            }
-            else{
-                fireplacestatus.fireplace = "ON"
-            }
-            fireplacestatus.physicalrelay = fireplacestatus.fireplace;
-
-            sendSmartThingMsg("fireplace",fireplacestatus.fireplace);
-            logger("HTTP","Request at /api/fireplace");
-            res.send(fireplacestatus);
-            break;
-        case "garagedoor":
-            var garagedoorstatus = {
-                garagedoor: "",
-                physicalrelaygarage: ""
-            }
-            physicalrelaygarage = readrelaystate("garagedoor",relaygarage,relaystategarage);
-            if (physicalrelaygarage == 1) {
-                garagedoorstatus.garagedoor = "OFF"
-            }
-            else{
-                garagedoorstatus.garagedoor = "ON"
-            }
-            garagedoorstatus.physicalrelaygarage = garagedoorstatus.garagedoor;
-            sendSmartThingMsg("garagedoor",garagedoorstatus.garagedoor);
-            logger("HTTP","Request at /api/garagedoor");
-            res.send(garagedoorstatus);
-            break;
-
-        case "garagegate":
-            var garagegatestatus = {
-                garagegate: "",
-                physicalrelaygaragegate: ""
-            }
-            physicalrelaygaragegate = readrelaystate("garagegate",relaygaragegate,relaystategaragegate);
-            if (physicalrelaygaragegate == 1) {
-                garagegatestatus.garagegate = "OFF"
-            }
-            else{
-                garagegatestatus.garagegate = "ON"
-            }
-            garagegatestatus.physicalrelaygaragegate = garagegatestatus.garagegate;
-            sendSmartThingMsg("garagegate",garagegatestatus.garagegate);
-            logger("HTTP","Request at /api/garagegate");
-            res.send(garagegatestatus);
-            break;
-
-        case "fireplacetemperature":
-            var fireplacetemperature = {
-                vartemperatureF: "",
-                vartemperatureC: "",
-                varhumidity: ""
-            }
-            sensor.read(11, 21, function(err, temperature, humidity) {
-                if (!err) {
-
-                    fireplacetemperature.vartemperatureF = (temperature.toFixed(1) * 9 / 5 + 32 )
-                    fireplacetemperature.vartemperatureC = (temperature.toFixed(1))
-                    fireplacetemperature.varhumidity = humidity.toFixed(1)
-                    logger("HTTP","Request at /api/fireplacetemperature");
-                    logger("HTTP","Temperature in Fahrenheit: " + fireplacetemperature.vartemperatureF + ' °F');
-                    logger("HTTP","Temperature in Celsius: " + fireplacetemperature.vartemperatureC + ' °C');
-                    logger("HTTP","Humidity: " + fireplacetemperature.varhumidity + ' %');
-
-                    var temphumi = (fireplacetemperature.vartemperatureF.toString() + "-" + fireplacetemperature.varhumidity.toString())
-                    sendSmartThingMsg("fireplacetemperature",temphumi);
-                    res.send(fireplacetemperature);
-                }
-                else{
-                    logger("HTTP","Error: " + err);
-                    res.send("Error: " + err);
-                }
-            });
-            break;
-
-        default:
-            res.status(404).send("Device not found");
-            break;
+            res.send(temperature);
+        });
     }
 });
 
-api.get('/:device/:command', function (req, res) {
-    let device = req.params['device']
-    let command = req.params['command']
+// Apply maintained commands or start/report a momentary pulse without extending it.
+api.get('/:device/:command', function handleRelayCommandRequest(req, res) {
+    let deviceName = req.params['device'];
+    let command = req.params['command'];
     let ip = req.ip;
-    logger("/api/"+device+"/"+command,"Received request at: " + device + " " + command + "Source IP: "+ip);
-    switch (device) {
-        case "fireplace":
-            switch (command) {
-                case "on":
-                    relaycontrol(0);
-                    logger("HTTP","Request at /api/fireplace/on");
-                    res.end();
-                    break;
-
-                case "off":
-                    relaycontrol(1);
-                    logger("HTTP","Request at /api/fireplace/off");
-                    res.end();
-                    break;
-                default:
-                    res.status(404).send("Command not found");
-                    break;
-            }
-            break;
-        case "garagedoor":
-        case "garagegate":
-            switch (command) {
-                case "on":
-                    if (garagePulseTimers[device] === null) {
-                        relaycontrolgarage(device);
-                        logger("HTTP","Request at /api/"+device+"/on");
-                    }
-                    else{
-                        reportgaragestate(0,device);
-                        logger("HTTP","Relay " + device + " already ON");
-                    }
-                    res.end();
-                    break;
-
-                case "off":
-                    reportgaragestate(garagePulseTimers[device] === null ? 1 : 0,device);
-                    if (garagePulseTimers[device] !== null) {
-                        logger("HTTP","Request at /api/"+device+"/off");
-                    }
-                    else{
-                        logger("HTTP","Relay " + device + " already OFF");
-                    }
-                    res.end();
-                    break;
-                default:
-                    res.status(404).send("Command not found");
-                    break;
-            }
-            break;
-
-        default:
-            res.status(404).send("Device not found");
-            break;
+    logMessage("/api/"+deviceName+"/"+command,"Received request at: " + deviceName + " " + command + " Source IP: "+ip);
+    var item = deviceRegistry.get(deviceName);
+    if (!item || item.config.type !== 'switch') {
+        res.status(404).send("Device not found");
+        return;
     }
-});
-
-/**
- * discover
- */
-// Used to send all devices back
-app.get("/discover", function (req, res) {
-    devicesDiscover();
+    switch (command) {
+        case "on":
+            if (item.config.mode === 'momentary') {
+                pulseRelay(deviceName);
+            }
+            else{
+                setRelayOutput(getRelayOutputLevel(item,true),deviceName);
+            }
+            break;
+        case "off":
+            if (item.config.mode === 'momentary') {
+                verifyAndReportRelayOutput(getRelayOutputLevel(item,item.pulseTimer !== null),deviceName);
+            }
+            else{
+                setRelayOutput(getRelayOutputLevel(item,false),deviceName);
+            }
+            break;
+        default:
+            res.status(404).send("Command not found");
+            return;
+    }
+    logMessage("HTTP","Request at /api/" + deviceName + "/" + command);
     res.end();
 });
 
-// app.get("/api/fireplace", function (req, res) {
-//     var fireplacestatus = {
-//         fireplace: ""
-//     }
-//     if (relaystate == 1) {
-//         fireplacestatus.fireplace = "OFF"
-//     }
-//     else{
-//         fireplacestatus.fireplace = "ON"
-//     }
-//     sendSmartThingMsg("fireplace",fireplacestatus.fireplace);
-//     logger("HTTP","Request at /api/fireplace");
-//     res.send(fireplacestatus);
-// });
+// Queue discovery descriptors for Hubitat; the HTTP response has no body.
+app.get("/discover", function handleDiscoveryRequest(req, res) {
+    sendDeviceDiscovery();
+    res.end();
+});
 
-// app.get("/api/fireplace/on", function (req, res) {
-//     if (relaystate == 1) {
-//         relaycontrol();
-//         logger("HTTP","Request at /api/fireplace/on");
-//     }
-//     else{
-//         logger("HTTP","Relay already ON");
-//     }
-//     res.end();
-// });
-
-// app.get("/api/fireplace/off", function (req, res) {
-//     if (relaystate == 0) {
-//         relaycontrol();
-//         logger("HTTP","Request at /api/fireplace/off");
-//     }
-//     else{
-//         logger("HTTP","Relay already OFF");
-//     }
-//     res.end();
-// });
-
-// app.get("/api/garagedoor", function (req, res) {
-//     var garagedoorstatus = {
-//         garagedoor: ""
-//     }
-//     if (relaystategarage == 1) {
-//         garagedoorstatus.garagedoor = "OFF"
-//     }
-//     else{
-//         garagedoorstatus.garagedoor = "ON"
-//     }
-//     sendSmartThingMsg("garagedoor",garagedoorstatus.garagedoor);
-//     logger("HTTP","Request at /api/garagedoor");
-//     res.send(garagedoorstatus);
-// });
-
-// app.get("/api/garagedoor/on", function (req, res) {
-//     if (relaystategarage == 1) {
-//         relaycontrolgarage();
-//         logger("HTTP","Request at /api/fireplace/on");
-//     }
-//     else{
-//         logger("HTTP","Relay GarageDoor already ON");
-//     }
-//     res.end();
-// });
-
-// app.get("/api/garagedoor/off", function (req, res) {
-//     if (relaystategarage == 0) {
-//         relaycontrolgarage();
-//         logger("HTTP","Request at /api/fireplace/off");
-//     }
-//     else{
-//         logger("HTTP","Relay GarageDoor already OFF");
-//     }
-//     res.end();
-// });
-
-/**
- * Subscribe route used by SmartThings Hub to register for callback/notifications and write to config.json
- * @param {String} host - The SmartThings Hub IP address and port number
- */
-app.get('/subscribe/:host', function (req, res, next) {
+// Save Hubitat's callback address, then report current outputs without operating them.
+app.get('/subscribe/:host', function handleSubscriptionRequest(req, res, next) {
     var parts = req.params.host.split(":");
     nconf.set('notify:address', parts[0]);
     nconf.set('notify:port', parts[1]);
     nconf.save(function (err) {
       if (err) {
-        logger("Subscribe",'Configuration error: '+err.message);
+        logMessage("Subscribe",'Configuration error: '+err.message);
         res.status(500).json({ error: 'Configuration error: '+err.message });
         return;
       }
       try {
-        reportrelaystates();
+        reportRelayStates();
       } catch (err) {
-        logger("Subscribe",'Relay state reporting error: '+err.message);
+        logMessage("Subscribe",'Relay state reporting error: '+err.message);
         next(err);
         return;
       }
       res.end();
-      logger("Subscribe","SmartThings HUB IpAddress: "+parts[0] +" Port: "+ parts[1]);
+      logMessage("Subscribe","Hubitat IP address: "+parts[0] +" Port: "+ parts[1]);
     });
 });
 
 
-logger("HTTP Endpoint","All HTTP endpoints loaded");
+logMessage("HTTP Endpoint","All HTTP endpoints loaded");
 
-////////////////////////////////////////
-// Preparing GPIO
-////////////////////////////////////////
+// GPIO initialization
 // onoff expects global sysfs GPIO numbers, not BCM line offsets.
 var gpioRoot = '/sys/class/gpio';
-var gpioChips = fs.readdirSync(gpioRoot).filter(function (name) {
-    return /^gpiochip\d+$/.test(name) &&
-        fs.readFileSync(gpioRoot + '/' + name + '/label', 'utf8').trim() == 'pinctrl-bcm2835';
+var relayDevices = Array.from(deviceRegistry.values()).filter(function (item) {
+    return item.config.type === 'switch';
 });
-if (gpioChips.length != 1) {
-    throw new Error('Expected one pinctrl-bcm2835 GPIO controller in ' + gpioRoot + ', found ' + gpioChips.length);
+if (relayDevices.length > 0) {
+    var gpioChips = fs.readdirSync(gpioRoot).filter(function (name) {
+        return /^gpiochip\d+$/.test(name) &&
+            fs.readFileSync(gpioRoot + '/' + name + '/label', 'utf8').trim() == 'pinctrl-bcm2835';
+    });
+    if (gpioChips.length != 1) {
+        throw new Error('Expected one pinctrl-bcm2835 GPIO controller in ' + gpioRoot + ', found ' + gpioChips.length);
+    }
+    var gpioBaseValue = fs.readFileSync(gpioRoot + '/' + gpioChips[0] + '/base', 'utf8').trim();
+    var gpioBase = Number(gpioBaseValue);
+    if (!/^\d+$/.test(gpioBaseValue) || !Number.isSafeInteger(gpioBase)) {
+        throw new Error('Invalid sysfs GPIO base: ' + gpioBaseValue);
+    }
+    logMessage("GPIO","Using " + gpioChips[0] + " with sysfs base " + gpioBase);
 }
-var gpioBaseValue = fs.readFileSync(gpioRoot + '/' + gpioChips[0] + '/base', 'utf8').trim();
-var gpioBase = Number(gpioBaseValue);
-if (!/^\d+$/.test(gpioBaseValue) || !Number.isSafeInteger(gpioBase)) {
-    throw new Error('Invalid sysfs GPIO base: ' + gpioBaseValue);
-}
-logger("GPIO","Using " + gpioChips[0] + " with sysfs base " + gpioBase);
 
-// 'high' initializes these active-low relays OFF without an initial LOW pulse.
-var relay = new Gpio(gpioBase + 23, 'high');
-var relaygarage = new Gpio(gpioBase + 24, 'high');
-var relaygaragegate = new Gpio(gpioBase + 25, 'high');
-relaystate = relay.readSync();
-relaystategarage = relaygarage.readSync();
-relaystategaragegate = relaygaragegate.readSync();
-if (relaystate !== 1 || relaystategarage !== 1 || relaystategaragegate !== 1) {
-    throw new Error('Relay initialization failed: all relays must be OFF before starting the HTTP server');
-}
-logger("GPIO","All relays initialized OFF");
+// Initialize outputs directly to their OFF level before starting the HTTP server.
+relayDevices.forEach(function (item) {
+    item.relayGpio = new Gpio(gpioBase + item.config.gpio, item.config.activeLow ? 'high' : 'low');
+});
+relayDevices.forEach(function (item) {
+    item.confirmedRelayState = readRelayOutput(item.config.name,item.relayGpio,item.confirmedRelayState);
+    item.observedRelayState = item.confirmedRelayState;
+    if (item.confirmedRelayState !== getRelayOutputLevel(item,false)) {
+        throw new Error('Relay initialization failed for ' + item.config.name + ': all relays must be OFF before starting the HTTP server');
+    }
+});
+logMessage("GPIO","All relays initialized OFF");
 
-var pushButton = new Gpio(gpioBase + 4, 'in', 'both'); //BCM GPIO4, monitoring both edges
+// Record each manual input's baseline without applying it to the relay at startup.
+relayDevices.forEach(function (item) {
+    if (item.config.manualInput) {
+        item.manualInputGpio = new Gpio(gpioBase + item.config.manualInput.gpio, 'in', 'both');
+        item.confirmedInputState = readManualInput(item);
+        item.candidateInputState = item.confirmedInputState;
+    }
+});
 
-////////////////////////////////////////
-// Creating Server
-////////////////////////////////////////
+// HTTP server
 var server = http.createServer(app);
-server.listen(httpport);
-logger("HTTP Endpoint","HTTP Server Created at port: "+httpport);
+server.listen(httpPort);
+logMessage("HTTP Endpoint","HTTP Server Created at port: "+httpPort);
 
-///////////////////////////////////////////
-// Function to send fireplace msgs to SmartThing
-///////////////////////////////////////////
-function sendSmartThingMsg(device,command) {
-    var msg = JSON.stringify({device: device,command: command});
-    notify(msg);
-    logger("SendHubitatMsg","Queued Hubitat state: " + msg);
+// Queue a relay state or sensor reading using Hubitat's existing message format.
+function queueDeviceStateNotification(deviceName,command) {
+    var message = JSON.stringify({device: deviceName,command: command});
+    queueHubitatNotification(message);
+    logMessage("Hubitat","Queued Hubitat state: " + message);
 }
 
-///////////////////////////////////////////
-// Send HTTP callback to SmartThings HUB
-///////////////////////////////////////////
-/**
- * Callback to the SmartThings Hub via HTTP NOTIFY
- * @param {String} data - The HTTP message body
- */
+// Hubitat notification delivery
 var notificationQueue = new Map();
 var notificationInFlight = false;
-var notificationTimeout = 5000;
+var notificationTimeoutMs = 5000;
 var notificationRetryDelays = [5000, 15000, 30000];
 
-var notify = function(data) {
+// Coalesce pending updates per device or message type, then start delivery.
+var queueHubitatNotification = function(data) {
     var message = JSON.parse(data);
     var key = message.device ? 'device:' + message.device : 'type:' + message.type;
     var entry = notificationQueue.get(key);
@@ -410,10 +331,11 @@ var notify = function(data) {
             retryTimer: null
         });
     }
-    flushnotifications();
+    flushNotificationQueue();
 }
 
-function flushnotifications() {
+// Send one ready notification at a time and schedule bounded retries on failure.
+function flushNotificationQueue() {
     if (notificationInFlight) return;
     var entry = Array.from(notificationQueue.values()).find(function (item) {
         return item.retryTimer === null;
@@ -422,38 +344,40 @@ function flushnotifications() {
 
     notificationInFlight = true;
     var version = entry.version;
-    sendnotification(entry, function (err) {
+    sendHubitatNotification(entry, function (err) {
         notificationInFlight = false;
         if (err) {
-            logger("Notify","Notification error for " + entry.key + ": " + err.message);
+            logMessage("Notify","Notification error for " + entry.key + ": " + err.message);
             if (entry.retries < notificationRetryDelays.length) {
                 var delay = notificationRetryDelays[entry.retries++];
-                logger("Notify","Retrying " + entry.key + " in " + delay + "ms");
+                logMessage("Notify","Retrying " + entry.key + " in " + delay + "ms");
                 entry.retryTimer = setTimeout(function () {
                     entry.retryTimer = null;
-                    flushnotifications();
+                    flushNotificationQueue();
                 }, delay);
             } else {
                 notificationQueue.delete(entry.key);
-                logger("Notify","Retries exhausted for " + entry.key + "; a new update or periodic relay snapshot is required");
+                logMessage("Notify","Retries exhausted for " + entry.key + "; a new update or periodic relay snapshot is required");
             }
         } else {
-            logger("Notify","Hubitat accepted notification for " + entry.key);
+            logMessage("Notify","Hubitat accepted notification for " + entry.key);
             notificationQueue.delete(entry.key);
             if (entry.version !== version) {
                 entry.retries = 0;
                 notificationQueue.set(entry.key, entry);
             }
         }
-        flushnotifications();
+        flushNotificationQueue();
     });
 }
 
-function sendnotification(entry,callback) {
+// Deliver one HTTP NOTIFY, refreshing relay readback before every send or retry.
+function sendHubitatNotification(entry,callback) {
     var req;
     var timeout;
     var finished = false;
-    function finish(err) {
+    // Finish once, cancel the deadline, and close failed requests before notifying the queue.
+    function completeNotification(err) {
         if (finished) return;
         finished = true;
         if (timeout !== undefined) clearTimeout(timeout);
@@ -467,15 +391,10 @@ function sendnotification(entry,callback) {
         }
         var data = entry.data;
         // Queued or retried relay messages must describe the output now, not an old pulse.
-        if (entry.device === 'fireplace') {
-            physicalrelay = readrelaystate("fireplace",relay,relaystate);
-            data = JSON.stringify({device: entry.device, command: physicalrelay == 0 ? "ON" : "OFF"});
-        } else if (entry.device === 'garagedoor') {
-            physicalrelaygarage = readrelaystate("garagedoor",relaygarage,relaystategarage);
-            data = JSON.stringify({device: entry.device, command: physicalrelaygarage == 0 ? "ON" : "OFF"});
-        } else if (entry.device === 'garagegate') {
-            physicalrelaygaragegate = readrelaystate("garagegate",relaygaragegate,relaystategaragegate);
-            data = JSON.stringify({device: entry.device, command: physicalrelaygaragegate == 0 ? "ON" : "OFF"});
+        var item = deviceRegistry.get(entry.device);
+        if (item && item.config.type === 'switch') {
+            item.observedRelayState = readRelayOutput(entry.device,item.relayGpio,item.confirmedRelayState);
+            data = JSON.stringify({device: entry.device, command: getRelayStateLabel(item,item.observedRelayState)});
         }
         var opts = {
             method: 'NOTIFY',
@@ -485,238 +404,276 @@ function sendnotification(entry,callback) {
             headers: {
                 'CONTENT-TYPE': 'application/json',
                 'CONTENT-LENGTH': Buffer.byteLength(data),
-                'device': 'fireplace'
+                'device': entry.device || 'discover'
             }
         };
         req = http.request(opts, function (res) {
-            res.on('error', finish);
+            res.on('error', completeNotification);
             res.on('aborted', function () {
-                finish(new Error('Hubitat response was interrupted'));
+                completeNotification(new Error('Hubitat response was interrupted'));
             });
             res.on('end', function () {
                 if (res.statusCode >= 200 && res.statusCode < 300) {
-                    finish();
+                    completeNotification();
                 } else {
-                    finish(new Error('Hubitat returned HTTP ' + res.statusCode));
+                    completeNotification(new Error('Hubitat returned HTTP ' + res.statusCode));
                 }
             });
             res.resume();
         });
-        req.on('error', finish);
+        req.on('error', completeNotification);
         timeout = setTimeout(function () {
-            finish(new Error('Hubitat notification timed out after ' + notificationTimeout + 'ms'));
-        }, notificationTimeout);
-        logger("Notify","Sending notification: " + data);
+            completeNotification(new Error('Hubitat notification timed out after ' + notificationTimeoutMs + 'ms'));
+        }, notificationTimeoutMs);
+        logMessage("Notify","Sending notification: " + data);
         req.write(data);
         req.end();
     } catch (err) {
-        finish(err);
+        completeNotification(err);
     }
 }
 
-function readrelaystate(device,gpio,trackedstate) {
+// Read a valid output level and log differences from the last confirmed command.
+function readRelayOutput(deviceName,gpio,confirmedState) {
     if (!gpio || typeof gpio.readSync !== 'function') {
-        throw new Error('Relay not initialized: ' + device);
+        throw new Error('Relay not initialized: ' + deviceName);
     }
     var state = gpio.readSync();
     if (state !== 0 && state !== 1) {
-        throw new Error('Invalid relay readback for ' + device + ': ' + state);
+        throw new Error('Invalid relay readback for ' + deviceName + ': ' + state);
     }
-    if (state !== trackedstate) {
-        logger("GPIO","WARNING: Relay state mismatch for " + device + ": tracked " + trackedstate + ", read " + state);
+    if (state !== confirmedState) {
+        logMessage("GPIO","WARNING: Relay state mismatch for " + deviceName + ": tracked " + confirmedState + ", read " + state);
     }
     return state;
 }
 
-function reportrelaystates() {
-    physicalrelay = readrelaystate("fireplace",relay,relaystate);
-    physicalrelaygarage = readrelaystate("garagedoor",relaygarage,relaystategarage);
-    physicalrelaygaragegate = readrelaystate("garagegate",relaygaragegate,relaystategaragegate);
-    sendSmartThingMsg("fireplace",physicalrelay == 0 ? "ON" : "OFF");
-    sendSmartThingMsg("garagedoor",physicalrelaygarage == 0 ? "ON" : "OFF");
-    sendSmartThingMsg("garagegate",physicalrelaygaragegate == 0 ? "ON" : "OFF");
+// Read all relay outputs before queuing their snapshot; never operate a relay here.
+function reportRelayStates() {
+    relayDevices.forEach(function (item) {
+        item.observedRelayState = readRelayOutput(item.config.name,item.relayGpio,item.confirmedRelayState);
+    });
+    relayDevices.forEach(function (item) {
+        queueDeviceStateNotification(item.config.name,getRelayStateLabel(item,item.observedRelayState));
+    });
 }
 
-reportrelaystates();
+reportRelayStates();
 
-setInterval(function () {
+// Reconcile relay notifications periodically, logging failures for the next attempt.
+setInterval(function reconcileRelayStates() {
     try {
-        reportrelaystates();
+        reportRelayStates();
     } catch (err) {
-        logger("GPIO","Relay state reconciliation error: " + err.message);
+        logMessage("GPIO","Relay state reconciliation error: " + err.message);
     }
-}, 300000);
+}, relayReportIntervalMs);
 
-function devicesDiscover(){
-    if (nconf.get('discover')) {
-        notify(JSON.stringify(nconf.get('discover')));
-        logger("devicesDiscover","Sending devices back: " + JSON.stringify(nconf.get('discover')));
-    } else {
-        logger("devicesDiscover","discover config json not set.");
-    }
+// Advertise configured device identities without exposing hardware settings.
+function sendDeviceDiscovery(){
+    var discovery = {
+        type: "discover",
+        devices: Array.from(deviceRegistry.values()).map(function (item) {
+            return {
+                type: item.config.type,
+                devicetypename: item.config.devicetypename,
+                name: item.config.name,
+                label: item.config.label
+            };
+        })
+    };
+    queueHubitatNotification(JSON.stringify(discovery));
+    logMessage("Discovery","Sending devices back: " + JSON.stringify(discovery));
     return;
 }
 
-function createID() {
-    return Math.random().toString(26).slice(2)
+// Create a short identifier to correlate manual-input checks in the log.
+function createLogCorrelationId() {
+    return Math.random().toString(26).slice(2);
 }
 
-function switchchanged(callbackswitchsate){
-    var icount = 0;
-    var checkcount = 2;
-    var waitcheck = 500;
-    var swuID = createID();
-    newswitchstate = pushButton.readSync();
-    logger(swuID+"-"+"SWITCHCHANGED","Checking current switch state: " + newswitchstate);
-    if (oldswitchstate != newswitchstate) {
-        logger(swuID+"-"+"SWITCHCHANGED","Looks like switch was changed to: " + newswitchstate);
-        var interval = setInterval(function(){
-            newswitchstate = pushButton.readSync();
-            if (icount >= checkcount) {
-                if (oldswitchstate != newswitchstate) {
-                    logger(swuID+"-"+"SWITCHCHANGED","Checking if the switch was changed for " + checkcount + " times, in " + waitcheck + "ms, the final state is " + newswitchstate + ". The SWITCH was really changed and keep in that state.");
-                    oldswitchstate = newswitchstate;
-                    callbackswitchsate(true);
+// Read a manual input and reject GPIO levels other than LOW or HIGH.
+function readManualInput(item) {
+    var state = item.manualInputGpio.readSync();
+    if (state !== 0 && state !== 1) {
+        throw new Error('Invalid manual input readback for ' + item.config.name + ': ' + state);
+    }
+    return state;
+}
+
+// Confirm a stable input change with one polling interval per device.
+function checkManualInputChange(deviceName,callback){
+    var item = getRelayDevice(deviceName);
+    if (item.inputCheckTimer !== null) return;
+    var stableCheckCount = 0;
+    var requiredChecks = item.config.manualInput.checkCount;
+    var checkIntervalMs = item.config.manualInput.checkIntervalMs;
+    var checkId = createLogCorrelationId();
+    item.candidateInputState = readManualInput(item);
+    logMessage(checkId+"-ManualInput","Checking " + deviceName + " input state: " + item.candidateInputState);
+    if (item.confirmedInputState != item.candidateInputState) {
+        logMessage(checkId+"-ManualInput","Possible input change to: " + item.candidateInputState);
+        // Reset the count on sampled changes; clear the timer before applying a result.
+        item.inputCheckTimer = setInterval(function confirmManualInputChange(){
+            try {
+                var state = readManualInput(item);
+                if (state !== item.candidateInputState) {
+                    item.candidateInputState = state;
+                    stableCheckCount = 0;
                 }
-                else{
-                    logger(swuID+"-"+"SWITCHCHANGED","Checking if the switch was changed for " + checkcount + " times, in " + waitcheck + "ms, the final state is " + newswitchstate + ". It was a falso positive and the switch goes back to the original state.");
-                    callbackswitchsate(false);
+                if (stableCheckCount >= requiredChecks) {
+                    clearInterval(item.inputCheckTimer);
+                    item.inputCheckTimer = null;
+                    if (item.confirmedInputState != item.candidateInputState) {
+                        logMessage(checkId+"-ManualInput","Confirmed input state after " + requiredChecks + " checks at " + checkIntervalMs + "ms: " + item.candidateInputState);
+                        item.confirmedInputState = item.candidateInputState;
+                        callback(true);
+                    }
+                    else{
+                        logMessage(checkId+"-ManualInput","Input returned to its confirmed state; ignoring the change");
+                        callback(false);
+                    }
                 }
-                clearInterval(interval);
+                stableCheckCount++;
+            } catch (err) {
+                if (item.inputCheckTimer !== null) clearInterval(item.inputCheckTimer);
+                item.inputCheckTimer = null;
+                logMessage("ManualInput","Manual input error for " + deviceName + ": " + err.message);
             }
-            icount++;
-          }, waitcheck);
+          }, checkIntervalMs);
     }
     else{
-        logger(swuID+"-"+"SWITCHCHANGED","Switch was not changed false positive!");
-        callbackswitchsate(false);
+        logMessage(checkId+"-ManualInput","Input state unchanged; ignoring the edge");
+        callback(false);
     }
 }
 
-//switchchanged();
-
-pushButton.watch(function (err, value) { //Watch for hardware interrupts on pushButton GPIO, specify callback function
-    var puuID = createID();
-    logger(puuID+"-"+"PUSHBUTTON","PUSHBUTTON event detected!");
-    if (err) { //if an error
-        console.error('There was an error', err); //output error message to console
-        logger(puuID+"-"+"PUSHBUTTON","PUSHBUTTON Error" + err);
-        return;
-    }
-    logger(puuID+"-"+"PUSHBUTTON","Checking if SWITCH was changed...");
-    switchchanged(function (switchchanged) {
-        if (switchchanged) {
-            logger(puuID+"-"+"PUSHBUTTON","Switch changed!");
-            // The pushbutton is currently disabled for test
-            //relaycontrol()
+// Manual-input monitoring
+relayDevices.forEach(function (item) {
+    if (!item.manualInputGpio) return;
+    // Check input edges and follow confirmed changes only when control is enabled.
+    item.manualInputGpio.watch(function handleManualInputEdge(err, value) {
+        var deviceName = item.config.name;
+        var eventId = createLogCorrelationId();
+        logMessage(eventId+"-ManualInput","Input edge detected for " + deviceName);
+        if (err) {
+            console.error('There was an error', err);
+            logMessage(eventId+"-ManualInput","Manual input watch error for " + deviceName + ": " + err);
+            return;
         }
-        else{
-            logger(puuID+"-"+"PUSHBUTTON","Switch not changed!");
+        try {
+            // Apply only confirmed changes, allowing API commands to override unchanged inputs.
+            checkManualInputChange(deviceName,function applyManualInputChange(changed) {
+                if (changed) {
+                    if (item.config.manualInput.controlEnabled) {
+                        var on = item.candidateInputState === (item.config.manualInput.activeLow ? 0 : 1);
+                        setRelayOutput(getRelayOutputLevel(item,on),deviceName);
+                    }
+                    else{
+                        logMessage(eventId+"-ManualInput","Manual relay control disabled for " + deviceName);
+                    }
+                }
+                else{
+                    logMessage(eventId+"-ManualInput","No confirmed input change");
+                }
+            });
+        } catch (err) {
+            logMessage("ManualInput","Manual input error for " + deviceName + ": " + err.message);
         }
-        //return switchchanged;
     });
 });
 
-function relaycontrol(requestedstate){
-    if (requestedstate !== 0 && requestedstate !== 1) {
-        throw new Error('Invalid fireplace relay state: ' + requestedstate);
+// Write a requested GPIO level, then verify it before reporting successful control.
+function setRelayOutput(requestedLevel,deviceName){
+    var item = getRelayDevice(deviceName);
+    if (requestedLevel !== 0 && requestedLevel !== 1) {
+        throw new Error('Invalid relay state for ' + deviceName + ': ' + requestedLevel);
     }
-    logger("RELALAYCONTROL","Setting Relay State to: " + requestedstate);
-    relay.writeSync(requestedstate);
-    physicalrelay = relay.readSync();
-    if (physicalrelay !== requestedstate) {
-        throw new Error('Fireplace relay verification failed: requested ' + requestedstate + ', read ' + physicalrelay);
-    }
-    relaystate = physicalrelay;
-    sendSmartThingMsg("fireplace",relaystate == 0 ? "ON" : "OFF");
+    logMessage("Relay","Setting " + deviceName + " output level to: " + requestedLevel);
+    item.relayGpio.writeSync(requestedLevel);
+    verifyAndReportRelayOutput(requestedLevel,deviceName);
 };
 
-function getgaragerelay(device) {
-    if (device === "garagedoor") return relaygarage;
-    if (device === "garagegate") return relaygaragegate;
-    throw new Error('Unknown garage relay: ' + device);
+// Confirm the expected level, update command state, and queue the Hubitat event.
+function verifyAndReportRelayOutput(expectedLevel,deviceName) {
+    var item = getRelayDevice(deviceName);
+    var state = item.relayGpio.readSync();
+    item.observedRelayState = state;
+    if (state !== expectedLevel) {
+        throw new Error('Relay verification failed for ' + deviceName + ': expected ' + expectedLevel + ', read ' + state);
+    }
+    item.confirmedRelayState = state;
+    queueDeviceStateNotification(deviceName,getRelayStateLabel(item,state));
 }
 
-function reportgaragestate(expectedstate,device) {
-    var state = getgaragerelay(device).readSync();
-    if (device === "garagedoor") {
-        physicalrelaygarage = state;
-    } else {
-        physicalrelaygaragegate = state;
+// Start one momentary pulse, preserving its release timer across repeated requests.
+function pulseRelay(deviceName) {
+    var item = getRelayDevice(deviceName);
+    if (item.config.mode !== 'momentary') {
+        throw new Error('Relay is not momentary: ' + deviceName);
     }
-    if (state !== expectedstate) {
-        throw new Error('Garage relay verification failed for ' + device + ': expected ' + expectedstate + ', read ' + state);
+    if (item.pulseTimer !== null) {
+        verifyAndReportRelayOutput(getRelayOutputLevel(item,true),deviceName);
+        logMessage("HTTP","Relay " + deviceName + " already ON");
+        return;
     }
-    if (device === "garagedoor") {
-        relaystategarage = state;
-    } else {
-        relaystategaragegate = state;
-    }
-    sendSmartThingMsg(device,state == 0 ? "ON" : "OFF");
-}
-
-function relaycontrolgarage(device) {
-    var gpio = getgaragerelay(device);
-    logger("RELALAYCONTROLGARAGE","Changing " + device + " Relay State to ON");
+    var gpio = item.relayGpio;
+    logMessage("Relay","Changing " + deviceName + " relay state to ON");
     // Keep release scheduled even if the ON write, readback, or notification fails.
-    garagePulseTimers[device] = setTimeout(function() {
-        logger("RELALAYCONTROLGARAGE","Changing " + device + " Relay State to OFF");
-        gpio.writeSync(1);
-        reportgaragestate(1,device);
-        garagePulseTimers[device] = null;
-     }, 4500);
-    gpio.writeSync(0);
-    reportgaragestate(0,device);
+    item.pulseTimer = setTimeout(function releaseRelayPulse() {
+        logMessage("Relay","Changing " + deviceName + " relay state to OFF");
+        gpio.writeSync(getRelayOutputLevel(item,false));
+        verifyAndReportRelayOutput(getRelayOutputLevel(item,false),deviceName);
+        item.pulseTimer = null;
+     }, item.config.pulseMs);
+    gpio.writeSync(getRelayOutputLevel(item,true));
+    verifyAndReportRelayOutput(getRelayOutputLevel(item,true),deviceName);
 }
 
-// ####################################
-// ######## Temperature Code ##########
-// ####################################
-function collecttemperature(){
-
-    sensor.read(11, 21, function(err, temperature, humidity) {
+// Read a configured DHT sensor, notify Hubitat, and optionally return HTTP values.
+function readTemperature(deviceName,callback){
+    var item = deviceRegistry.get(deviceName);
+    if (!item || item.config.type !== 'temperature') {
+        throw new Error('Unknown temperature sensor: ' + deviceName);
+    }
+    temperatureSensor.read(item.config.sensorType, item.config.gpio, function(err, temperature, humidity) {
+        if (!err && (!Number.isFinite(temperature) || !Number.isFinite(humidity))) {
+            err = new Error('Invalid temperature or humidity reading');
+        }
         if (!err) {
 
-            var vartemperatureF = (temperature.toFixed(1) * 9 / 5 + 32 )
-            var vartemperatureC = (temperature.toFixed(1))
-            var varhumidity = humidity.toFixed(1)
+            var temperatureCelsius = temperature.toFixed(1);
+            var temperatureFahrenheit = temperatureCelsius * 9 / 5 + 32;
+            var humidityPercent = humidity.toFixed(1);
 
-            logger("collecttemperature","Temperature in Fahrenheit: " + vartemperatureF + ' °F');
-            logger("collecttemperature","Temperature in Celsius: " + vartemperatureC + ' °C');
-            logger("collecttemperature","Humidity: " + varhumidity + ' %');
-            var temphumi = (vartemperatureF.toString() + "-" + varhumidity.toString())
-            sendSmartThingMsg("fireplacetemperature",temphumi);
+            logMessage("Temperature",deviceName + " Temperature in Fahrenheit: " + temperatureFahrenheit + ' °F');
+            logMessage("Temperature",deviceName + " Temperature in Celsius: " + temperatureCelsius + ' °C');
+            logMessage("Temperature",deviceName + " Humidity: " + humidityPercent + ' %');
+            var readingMessage = temperatureFahrenheit.toString() + "-" + humidityPercent;
+            queueDeviceStateNotification(deviceName,readingMessage);
+            if (callback) callback(null, {
+                vartemperatureF: temperatureFahrenheit,
+                vartemperatureC: temperatureCelsius,
+                varhumidity: humidityPercent
+            });
         }
         else{
-            logger("collecttemperature","Error: " + err);
+            logMessage("Temperature",deviceName + " Error: " + err);
+            if (callback) callback(err);
         }
     });
-
-
 };
 
-
-function celsiusToFahrenheit(celsius)
-{
-  var cTemp = celsius;
-  var cToFahr = cTemp * 9 / 5 + 32;
-  var message = cTemp+'\xB0C is ' + cToFahr + ' \xB0F.';
-  return cToFahr;
-  //  console.log(message);
-}
-
-function fahrenheitToCelsius(fahrenheit)
-{
-  var fTemp = fahrenheit;
-  var fToCel = (fTemp - 32) * 5 / 9;
-  var message = fTemp+'\xB0F is ' + fToCel + '\xB0C.';
-  //  console.log(message);
-}
-
-
-interval = setInterval(function () { //#C
-    collecttemperature()
-}, 900000);
-
-// 5 seconds is 5000
-// 15 minutes is 900000
+// Temperature polling
+deviceRegistry.forEach(function (item, deviceName) {
+    if (item.config.type === 'temperature') {
+        // Read this sensor at its own configured interval and log polling failures.
+        setInterval(function pollTemperature() {
+            try {
+                readTemperature(deviceName);
+            } catch (err) {
+                logMessage("Temperature",deviceName + " Error: " + err.message);
+            }
+        }, item.config.pollIntervalMs);
+    }
+});

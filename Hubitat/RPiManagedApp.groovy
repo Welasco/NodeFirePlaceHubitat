@@ -14,7 +14,7 @@ definition(
     iconUrl: "https://graph.api.smartthings.com/api/devices/icons/st.Home.home29-icn",
     iconX2Url: "https://graph.api.smartthings.com/api/devices/icons/st.Home.home29-icn?displaySize=2x",
     iconX3Url: "https://graph.api.smartthings.com/api/devices/icons/st.Home.home29-icn?displaySize=3x",
-    singleInstance: true
+    singleInstance: false
 )
 
 import groovy.json.JsonBuilder
@@ -31,7 +31,7 @@ def page1() {
       input "proxyPort", "text", title: "Proxy Port", description: "(ie. 3001)", required: true, defaultValue: "3001"
     }
     section("Discover Devices"){
-      input "enableDiscovery", "bool", title: "Discover Devices (WARNING: all existing devices will be removed)", required: false, defaultValue: false      
+      input "enableDiscovery", "bool", title: "Discover Devices (adds missing devices; keeps existing devices)", required: false, defaultValue: false
     }    
 		section("Enable Debug Log at IDE"){
 			input "idelog", "bool", title: "Select True or False:", defaultValue: false, required: false
@@ -41,26 +41,24 @@ def page1() {
 
 def installed() {
   writeLog("RPiManagedApp - Installed with settings: ${settings}")
-	initialize()
   updated()
-  addFirstDeviceType()
 }
 
 def updated() {
 
   writeLog("RPiManagedApp - Updated with settings: ${settings}")
-	//unsubscribe()
-	//initialize()
+	unsubscribe()
+	initialize()
   sendCommand('/subscribe/'+getNotifyAddress())
   if (settings.enableDiscovery) {
-    //delay discovery for 5 seconds
-    runIn(10, discoverChildDevices)
-    settings.enableDiscovery = false
+    // Allow subscription to finish before discovering devices.
+    runIn(10, "discoverChildDevices")
+    app.updateSetting("enableDiscovery", [value: "false", type: "bool"])
   }    
 }
 
 def initialize() {
-    subscribe(location, null, lanResponseHandler, [filterEvents:false])
+    subscribe(location, null, "lanResponseHandler", [filterEvents:false])
     writeLog("RPiManagedApp - Initialize")
 }
 
@@ -69,7 +67,7 @@ def uninstalled() {
 }
 
 private removeChildDevices() {
-    getAllChildDevices().each { deleteChildDevice(it.deviceNetworkId) }
+    getChildDevices().collect { it.deviceNetworkId }.each { deleteChildDevice(it) }
     writeLog("RPiManagedApp - Removing all child devices")
 }
 
@@ -80,17 +78,28 @@ def discoverChildDevices() {
 
 def lanResponseHandler(evt) {
     try{
-      def map = parseLanMessage(evt)
+      def description = evt instanceof String ? evt : evt.description
+      def map = parseLanMessage(description)
+      if (map.networkAddress?.toUpperCase() != GetDeviceID()) {
+        return
+      }
       def headers = map.headers;
-      def body = map.data;
+      def body = map.json ?: map.data
+      if (body instanceof String) {
+        body = new JsonSlurper().parseText(body)
+      }
+      else if (!(body instanceof Map) && map.body) {
+        body = new JsonSlurper().parseText(map.body)
+      }
 
       writeLog("RPiManagedApp - Received event headers:  ${headers}")
       writeLog("RPiManagedApp - Received event body: ${body}")
-      //updateFireplaceDeviceType(body)
-      processEvent(body)
+      if (body instanceof Map && (body.type == "discover" || (body.device && body.command))) {
+        processEvent(body)
+      }
     }
-    catch(MissingMethodException){
-      pass
+    catch(Exception err){
+      log.error "RPiManagedApp - LAN event error: ${err.message}"
     }
 }
 
@@ -104,65 +113,59 @@ private processEvent(evt) {
   }
 }
 
-private addFirstDeviceType(){
-  def d = addChildDevice("RPi Managed", "RPi Managed Switch", GetDeviceID(), ["name": "fireplace", label: "Fireplace", completedSetup: true])
-  writeLog("RPiManagedApp - Added first device: DisplayName: ${d.displayName} - deviceId: ${deviceId}")  
-}
-
 private addChildDevices(devices) {
   writeLog("RPiManagedApp - Start addChildDevices: ${devices}")
-  def firstdevice = 0
-  def deviceId = ""
-  devices.each {
-    writeLog("RPiManagedApp - addChildDevices DeviceNum: ${} ${devices}")
-    if(firstdevice != 0){
-      deviceId = it.name
-      if (!getChildDevice(deviceId)) {
-        it.type = it.type.capitalize()
-        def d = addChildDevice("RPi Managed", it.devicetypename, deviceId, ["name": it.name, label: it.label, completedSetup: true])
-        writeLog("RPiManagedApp - Added device: DisplayName: ${d.displayName} - deviceId: ${deviceId}")
-      }      
-    }
-    else{
-      firstdevice = 1
-    }
-    // if(firstdevice == 0){
-    //   deviceId = GetDeviceID()
-    //   firstdevice = 1
-    // }
-    // else{
-    //   deviceId = it.name
-    // }
-    // if (!getChildDevice(deviceId)) {
-    //   it.type = it.type.capitalize()
-    //   def d = addChildDevice("RPi Managed", it.devicetypename, deviceId, ["name": it.name, label: it.label, completedSetup: true])
-    //   writeLog("RPiManagedApp - Added device: DisplayName: ${d.displayName} - deviceId: ${deviceId}")
-    // }
+  if (!(devices instanceof List)) {
+    log.error "RPiManagedApp - Discovery devices must be a list"
+    return
   }
+  devices.each {
+    if (!(it instanceof Map) || !(it.name instanceof String) ||
+        !(it.name ==~ /[A-Za-z0-9][A-Za-z0-9_-]*/) ||
+        !(it.devicetypename instanceof String) || !it.devicetypename.trim() ||
+        !(it.label instanceof String) || !it.label.trim() ||
+        !(it.type in ["switch", "temperature"])) {
+      log.error "RPiManagedApp - Invalid discovery descriptor: ${it}"
+      return
+    }
+    def d = findRaspberryDevice(it.name)
+    if (!d) {
+      def deviceId = "${app.id}:${it.name}"
+      d = addChildDevice("RPi Managed", it.devicetypename, deviceId, ["name": it.name, label: it.label, completedSetup: true])
+      writeLog("RPiManagedApp - Added device: DisplayName: ${d.displayName} - deviceId: ${deviceId}")
+    }
+    d.updateDataValue("rpiDeviceName", it.name)
+  }
+}
+
+private findRaspberryDevice(name) {
+  def children = getChildDevices()
+  def d = children.find { it.deviceNetworkId == "${app.id}:${name}" }
+  if (!d) {
+    // Match only this app's legacy children; keep their IDs and automation references.
+    d = children.find { getRaspberryDeviceName(it) == name }
+  }
+  if (!d && name == "fireplace") {
+    d = children.find { !it.getDataValue("rpiDeviceName") && it.deviceNetworkId == GetDeviceID() }
+  }
+  return d
+}
+
+def getRaspberryDeviceName(child) {
+  return child.getDataValue("rpiDeviceName") ?: child.getName()
 }
 
 private parserDeviceCommand(evt) {
-	def deviceid = evt.device
-  if(deviceid == "fireplace"){
-    deviceid = GetDeviceID()
-  }  
-  def rpiDevice = getChildDevice(deviceid)
-  writeLog("RPiManagedApp - Method parserDeviceCommand rpiDevice: ${deviceid}")
+  def rpiDevice = findRaspberryDevice(evt.device)
+  writeLog("RPiManagedApp - Method parserDeviceCommand rpiDevice: ${evt.device}")
   if(rpiDevice){
     rpiDevice.Rpiparse(evt.command)
-    writeLog("RPiManagedApp - Updating rpiDevice Device ${deviceid} using Command: ${evt.command}")
+    writeLog("RPiManagedApp - Updating rpiDevice Device ${evt.device} using Command: ${evt.command}")
   }
-
-  // def FireplaceNetworkID = GetDeviceID()
-  // writeLog("RPiManagedApp - Method updateFireplaceDeviceType FireplaceNetworkID: ${FireplaceNetworkID}")
-  // def Fireplacedevice = getChildDevice(FireplaceNetworkID)
-  // if (Fireplacedevice) {
-  //   Fireplacedevice.Fireplaceparse("${evt.command}")
-  //   writeLog("RPiManagedApp - Updating Fireplace Device ${FireplaceNetworkID} using Command: ${cmd}")
-  // }
+  else{
+    log.warn "RPiManagedApp - Unknown device from configured Pi: ${evt.device}; run discovery"
+  }
 }
-
-
 
 private getProxyAddress() {
   return settings.proxyAddress + ":" + settings.proxyPort
@@ -173,10 +176,9 @@ private getNotifyAddress() {
   return hub.getDataValue("localIP") + ":" + hub.getDataValue("localSrvPortTCP")
 }
 
-private sendCommand(path) {
-  if (settings.proxyAddress.length() == 0 ||
-    settings.proxyPort.length() == 0) {
-    writeLog("RPiManagedApp - ERROR: Proxy configuration not set!")
+def sendCommand(path) {
+  if (!settings.proxyAddress || !settings.proxyPort) {
+    log.error "RPiManagedApp - Proxy configuration not set!"
     return
   }
 
@@ -200,9 +202,9 @@ private String GetDeviceID(){
     return deviceId
 }
 
-private writeLog(message)
+def writeLog(message)
 {
-  if(idelog){
+  if(settings.idelog){
     log.debug "${message}"
   }
 }

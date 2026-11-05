@@ -21,17 +21,17 @@ def Rpiparse(String description) {
 // Implement "switch"
 def on() {
     parent.writeLog("${device.getName()} - RPi Managed Switch Device Type - Sending command ON")
-    sendRaspberryCommand("${device.getName()}/on")    
+    sendRaspberryCommand("${parent.getRaspberryDeviceName(device)}/on")
 }
 
 def off() {
     parent.writeLog("${device.getName()} - RPi Managed Switch Device Type - Sending command OFF")
-    sendRaspberryCommand("${device.getName()}/off")  
+    sendRaspberryCommand("${parent.getRaspberryDeviceName(device)}/off")
 }
 
 def refresh() {
     parent.writeLog("${device.getName()} - RPi Managed Switch Device Type - Sending command Refresh")
-    sendRaspberryCommand("${device.getName()}")
+    sendRaspberryCommand("${parent.getRaspberryDeviceName(device)}")
 }
 
 def sendRaspberryCommand(String command) {

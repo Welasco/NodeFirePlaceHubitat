@@ -1,13 +1,17 @@
 # Raspberry Pi Relay and Temperature Integration for Hubitat
 
-A Node.js HTTP service that connects Raspberry Pi GPIO devices to Hubitat:
+A configuration-driven Node.js HTTP service that connects Raspberry Pi GPIO
+devices to Hubitat. Run the same code on multiple supported Pis, with one
+`config.json` and one Hubitat app instance per Pi.
 
-- A fireplace relay with explicit ON/OFF commands.
-- A garage-door relay and garage-gate relay with independent momentary pulses.
-- A DHT11 temperature and humidity sensor.
-- A monitored manual-switch input. Its fireplace-control action is currently disabled.
+The included configuration preserves the current hardware:
 
-The current implementation is on the **`v2` branch**. The entry point is
+- A fireplace relay with maintained ON/OFF commands.
+- A garage-door relay and garage-gate relay with independent 4.5-second pulses.
+- A DHT11 temperature and humidity sensor on BCM21.
+- A monitored manual-switch input on BCM4. Its fireplace-control action remains disabled.
+
+The configuration-driven implementation is on the **`v3` branch**. The entry point is
 [`fireplace.js`](fireplace.js).
 
 ## Hardware and wiring
@@ -63,7 +67,8 @@ the BCM offset automatically.
 | Garage-gate relay | 25 | 22 | 537 |
 | DHT11 data | 21 | 40 | Not used by the default DHT backend |
 
-Keep the DHT11 sensor calls at BCM21; do not add the sysfs base to them.
+Use BCM numbers in configuration for both relay and sensor pins; the app adds
+the sysfs base only for relays and manual inputs, never for DHT sensor calls.
 This app requires the legacy sysfs GPIO interface and the controller above.
 It is not a general-purpose implementation for every Raspberry Pi model,
 including Pi 5.
@@ -84,7 +89,7 @@ sudo apt install build-essential python3 pkg-config
 Clone and install directly on the Pi:
 
 ```bash
-git clone --branch v2 https://github.com/Welasco/NodeFirePlaceHubitat.git
+git clone --branch v3 https://github.com/Welasco/NodeFirePlaceHubitat.git
 cd NodeFirePlaceHubitat
 npm ci
 ```
@@ -102,11 +107,77 @@ Edit [`config.json`](config.json):
 | `httpport` | Node.js HTTP listening port; currently `3001`. |
 | `notify.address` | Hubitat IP address for callbacks. |
 | `notify.port` | Hubitat LAN callback port. |
-| `discover.devices` | Device descriptors returned through discovery notifications. |
+| `relayReportIntervalMs` | Relay reconciliation interval; currently `300000` (five minutes). |
+| `discover.devices` | The devices to create, control, poll, and advertise to Hubitat. |
 
 Hubitat registers its callback address through `/subscribe/:host`, and the
-app saves it to `config.json`. Preserve the discovery descriptors and keep
-`fireplace` first; the current Hubitat app assumes that ordering.
+app saves it to `config.json`, preserving the hardware settings. Discovery
+ordering no longer matters; the first device is discovered just like the others.
+
+Each device needs `type`, `devicetypename`, `name`, `label`, and `gpio`:
+
+| Device setting | Purpose |
+|---|---|
+| `name` | Stable API identifier, such as `fireplace`. Use letters, numbers, `_` and `-`, starting with a letter or number. |
+| `label` | Initial friendly Hubitat label. Existing child labels are preserved during discovery. |
+| `type` | `switch` or `temperature`. |
+| `devicetypename` | Installed Hubitat driver, currently `RPi Managed Switch` or `RPi Managed Temperature`. |
+| `gpio` | BCM GPIO number, from 0 to 27 for the supported boards. |
+| `activeLow` | Required for switches; `true` means LOW energizes the relay. |
+| `mode` | Required for switches; `maintained` or `momentary`. |
+| `pulseMs` | Required for momentary relays; each relay has its own duration and timer. |
+| `sensorType` | Required for temperature devices; `11` for DHT11 or `22` for DHT22. |
+| `pollIntervalMs` | Required for temperature devices; currently `900000` (15 minutes). |
+| `manualInput` | Optional input belonging to a maintained relay; see below. |
+
+Only listed devices are initialized and advertised. A Pi can have a different
+number of devices, different names, and different GPIO assignments. Removing
+a device from configuration does not automatically delete its Hubitat child.
+Names may repeat across Pis because their Hubitat app instances are isolated.
+Keep names stable within a Pi to preserve device associations; changing a name
+is treated as adding a different device, not renaming the existing one.
+
+Configuration is loaded at startup. Restart after editing it; there is no live
+reload. Invalid names, duplicate names/pins (including sensor and input pins),
+unsupported types/modes, missing hardware fields, and invalid timers stop
+startup before GPIO initialization. Older discovery-only configurations must
+be updated with the new hardware fields. Timer intervals must be positive
+integers no larger than `2147483647` milliseconds.
+
+### Optional manual input
+
+The included fireplace entry contains:
+
+```json
+"manualInput": {
+  "gpio": 4,
+  "activeLow": false,
+  "controlEnabled": false,
+  "checkIntervalMs": 500,
+  "checkCount": 2
+}
+```
+
+Keep `controlEnabled: false` to monitor/filter input changes without controlling
+the relay. To test manual control later, set it to `true` **for that device**
+and restart. Omit `manualInput` entirely when a relay has no wired input.
+Momentary garage operators and temperature devices cannot have manual inputs.
+
+With input `activeLow: false`, a confirmed HIGH input requests ON and LOW
+requests OFF; `true` reverses this mapping. Input polarity is independent of
+relay polarity and must match the wiring.
+
+The existing switch-checking approach is retained, with state and a checking
+interval per input. The default checks finish after three 500ms intervals
+(`checkCount` intermediate checks plus the final check); sampled changes reset
+the counter. Repeated edge events do not create overlapping checking intervals.
+Input and relay errors are logged without announcing successful control.
+
+All relays still start OFF, even when a manual input is initially active.
+The initial input is recorded as a baseline, not applied to the relay. After
+startup, a confirmed input change follows the input state, while an API command
+can override it. An unchanged input does not undo an API command; another
+confirmed input change is needed.
 
 Run from the repository directory because config and log paths are relative:
 
@@ -129,6 +200,8 @@ The HTTP port does not require root at its default value of 3001.
 ## HTTP API
 
 All routes below use HTTP GET. Replace the host and port as appropriate.
+Device routes use the configured `name`: `/api/:name`, `/api/:name/on`,
+and `/api/:name/off`. The table shows the included configuration.
 
 | Route | Behavior |
 |---|---|
@@ -155,19 +228,22 @@ curl http://127.0.0.1:3001/api/garagegate
 An OFF response is:
 
 ```json
-{"garagegate":"OFF","physicalrelaygaragegate":"OFF"}
+{"garagegate":"OFF","physicalrelay":"OFF"}
 ```
 
 Relay state is not door/gate position. There are no position sensors in this
 implementation. The HTTP endpoints are unauthenticated: keep this service
 on a trusted LAN and do not expose it to the Internet.
+Temperature read failures return HTTP 500 and are logged.
+All relay names return `{ "<name>": "OFF", "physicalrelay": "OFF" }` for an OFF
+reading. Relay status responses use the same fields regardless of the device name.
 
 ### Garage pulse duration
 
-Both garage relays share `relaycontrolgarage(device)` in `fireplace.js`.
-Its `setTimeout` delay is **4500 milliseconds (4.5 seconds)**. Changing that
-value changes the duration for both relays. Update the corresponding pulse
-expectations in `test/relay-control.test.js` when changing it.
+Momentary relays share `pulseRelay(deviceName)` in `fireplace.js`.
+Their `pulseMs` settings are **4500 milliseconds (4.5 seconds)** in the included
+configuration. Change each device's `pulseMs` independently in `config.json`
+and restart; no source-code change is needed.
 
 Each relay has its own timer. Repeated ON requests do not restart or extend
 an active pulse, and OFF requests do not shorten it. OFF is scheduled before
@@ -176,14 +252,16 @@ Node.js timers are not real-time guarantees or hardware safety cutoffs.
 
 ## Restart behavior and Hubitat synchronization
 
-At process startup, all three outputs are initialized HIGH/OFF and read back
+At process startup, all configured relay outputs are initialized OFF and read back
 before the HTTP server starts. Startup then reports their current states.
 A process restart interrupts any active garage pulse and initializes it OFF.
+Active-low outputs initialize HIGH and active-high outputs initialize LOW.
 
 This does not guarantee OFF while the process is stopped, during a crash
 before restart, during Pi boot, or after a hardware/power failure. GPIO
 readback confirms an output level, not relay-contact or appliance operation.
-The manual-switch filter remains active, but its relay-control call is disabled.
+The manual-switch filter remains active when configured, but relay control is
+disabled unless that device's `manualInput.controlEnabled` is `true`.
 
 Hubitat notifications use HTTP `NOTIFY` to `/notify`. Relay bodies have the form:
 
@@ -191,8 +269,8 @@ Hubitat notifications use HTTP `NOTIFY` to `/notify`. Relay bodies have the form
 {"device":"garagegate","command":"OFF"}
 ```
 
-State is reported after verified commands, status requests, startup, and
-subscription, and reconciled every five minutes. Notifications are serialized
+State is reported after verified API/manual commands, status requests, startup,
+and subscription, and reconciled at `relayReportIntervalMs`. Notifications are serialized
 and pending updates coalesce per device. Before sending or retrying a relay
 notification, the app reads its current output rather than replaying an old
 ON payload.
@@ -202,8 +280,9 @@ Requests have a five-second total deadline and up to three retries after
 can restore synchronization. Delivery retries never operate the relays.
 HTTP 2xx acceptance does not prove Hubitat applied a device event.
 
-With three relays, periodic reconciliation alone sends 36 notifications per
-hour. Temperature/humidity are collected every 15 minutes, as well as on demand.
+With the default three relays and five-minute reconciliation, periodic
+reconciliation alone sends 36 notifications per hour. Temperature/humidity
+are collected at each sensor's `pollIntervalMs`, as well as on demand.
 Temperature notifications retain the legacy Fahrenheit-humidity string format.
 
 ## Hubitat setup and discovering new devices
@@ -216,35 +295,46 @@ Install these files in Hubitat:
 | [`Hubitat/RPiManagedSwitch.groovy`](Hubitat/RPiManagedSwitch.groovy) | Drivers Code |
 | [`Hubitat/RPiManagedTemperature.groovy`](Hubitat/RPiManagedTemperature.groovy) | Drivers Code |
 
-Add the RPi Managed App, configure the Pi address/port, and enable discovery.
-The app registers its callback address and schedules discovery after 10 seconds.
-Device Names must match the Node.js names (`fireplace`, `garagedoor`,
-`garagegate`, and `fireplacetemperature`). Use Labels for friendly names.
+Add one RPi Managed App instance **per Pi**, configure its Pi address/port, and
+enable discovery. Give the instances distinct app labels so they are easy to
+identify. The app registers its callback address and schedules discovery after
+10 seconds. It then turns the discovery preference off.
 
-To discover `garagegate` without recreating existing devices:
+Each app accepts LAN notifications only from its configured Pi IP address.
+Callback source ports are not filtered: Node's outgoing callback connections
+do not originate from its HTTP listening port. Use a stable address/DHCP
+reservation per Pi; IP filtering is routing isolation, not authentication.
+
+All descriptors are discovered, including the first; there is no automatically
+created fireplace. New child network IDs use `<app-id>:<configured-name>`, so
+two Pis may both have a device called `fireplace` without collisions.
+Discovery stores `rpiDeviceName` on each child. Drivers use this stable name
+for requests, rather than a friendly/edited Hubitat device name.
+
+### Upgrading the existing Hubitat installation
 
 1. Create/download a Hubitat backup under Settings > Backup and Restore.
-2. Use the existing installed RPi Managed App; do not uninstall/reinstall it.
-3. Keep the current Pi address and discovery ordering unchanged, enable
-   Discover Devices, and save/Done.
-4. Wait for Garage Gate to appear, then turn discovery off and save again.
-5. Refresh the new device to populate its relay state.
+2. Update the managed app and both managed drivers above, retaining the existing
+   installed app instance and its Pi address. Do not uninstall/reinstall it.
+3. Deploy the `v3` Node code and updated configuration to the first Pi, then
+   restart. Restart initializes relays OFF.
+4. Enable Discover Devices on the existing app and save/Done. Discovery matches
+   its legacy children, keeps their network IDs and labels, and records their
+   configured names. Refresh the devices afterward.
+5. Deploy the same code with the second Pi's configuration, add a second managed
+   app instance with that Pi's address, and enable discovery on that instance.
 
-The current app's warning that discovery removes existing devices is outdated:
-discovery calls `getChildDevice` and adds only missing devices. The removal
-function is called by `uninstalled()`. Existing device records, settings, and
-automation references are retained when their IDs remain unchanged.
+Legacy matching searches only the installed app's own children, by stored
+name/device name, with the original IP-derived fireplace ID as a fallback.
+If you previously renamed a legacy child before it had `rpiDeviceName`, restore
+its original Device Name before discovery (the IP-derived fireplace can also
+be matched by its ID). Existing automation references remain intact when the
+same child is retained. Uninstalling an app deletes its children.
 
-Current Hubitat-code limitations:
-
-- Discovery skips the first descriptor, assuming it is the existing fireplace.
-  Its device network ID is derived from the Pi IP address.
-- The discovery flag is reset by direct assignment rather than the documented
-  `app.updateSetting` method; manually turn it off after discovery.
-- The temperature driver splits values on `-`, which cannot correctly handle
-  negative temperatures, and labels Fahrenheit readings using the hub's
-  configured temperature scale. Use a Fahrenheit-configured hub until that
-  conversion is addressed.
+The existing temperature driver still splits values on `-`, which cannot
+correctly handle negative temperatures, and labels Fahrenheit readings using
+the hub's configured temperature scale. Use a Fahrenheit-configured hub until
+that separate conversion issue is addressed.
 
 Official documentation:
 [child-device methods](https://docs2.hubitat.com/en/developer/app/app-object),
@@ -287,7 +377,7 @@ From the repository directory:
 git status
 git diff --summary
 git diff -- fireplace.js config.json
-git pull --ff-only origin v2
+git pull --ff-only origin v3
 ```
 
 Subscription changes can modify the tracked `config.json`. Preserve local
@@ -317,7 +407,18 @@ node --check fireplace.js
 ```
 
 The regression suite uses Node's built-in test runner with mocked GPIO,
-HTTP, and timers. It covers relay commands, verification failures, independent
-garage pulses, startup/discovery, and notification recovery. It does not
-validate physical wiring, relay contacts, or the installed Hubitat runtime.
-Test hardware behavior separately before connecting controlled loads.
+HTTP, sensors, and timers. It covers configured names/pins/polarity, configuration
+validation, relay commands, independent pulses, manual-input filtering and API
+overrides, startup/discovery, and notification recovery.
+
+With Java and Groovy installed, run the Hubitat mock checks from this directory:
+
+```bash
+groovy test/hubitat-managed-app.groovy
+```
+
+They cover multiple app instances, source-IP filtering, discovery ordering,
+legacy child preservation, stable driver routes, and error reporting.
+Neither suite validates physical wiring, relay contacts, or the installed
+Hubitat runtime. Test hardware behavior separately before connecting controlled
+loads, especially before enabling manual control.

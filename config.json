@@ -4,6 +4,7 @@
     "address": "192.168.2.201",
     "port": "39500"
   },
+  "relayReportIntervalMs": 300000,
   "discover":{
     "type": "discover",
     "devices": [
@@ -11,25 +12,46 @@
         "type": "switch",
         "devicetypename": "RPi Managed Switch",
         "name": "fireplace",
-        "label": "Fireplace"
+        "label": "Fireplace",
+        "gpio": 23,
+        "activeLow": true,
+        "mode": "maintained",
+        "manualInput": {
+          "gpio": 4,
+          "activeLow": false,
+          "controlEnabled": false,
+          "checkIntervalMs": 500,
+          "checkCount": 2
+        }
       },
       {
         "type": "switch",
         "devicetypename": "RPi Managed Switch",
         "name": "garagedoor",
-        "label": "Garage Door"
+        "label": "Garage Door",
+        "gpio": 24,
+        "activeLow": true,
+        "mode": "momentary",
+        "pulseMs": 4500
       },
       {
         "type": "switch",
         "devicetypename": "RPi Managed Switch",
         "name": "garagegate",
-        "label": "Garage Gate"
+        "label": "Garage Gate",
+        "gpio": 25,
+        "activeLow": true,
+        "mode": "momentary",
+        "pulseMs": 4500
       },
       {
         "type": "temperature",
         "devicetypename": "RPi Managed Temperature",
         "name": "fireplacetemperature",
-        "label": "Fireplace Temperature"
+        "label": "Fireplace Temperature",
+        "gpio": 21,
+        "sensorType": 11,
+        "pollIntervalMs": 900000
       }
     ]
   }
