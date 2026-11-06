@@ -11,8 +11,26 @@ The included configuration preserves the current hardware:
 - A DHT11 temperature and humidity sensor on BCM21.
 - A monitored manual-switch input on BCM4. Its fireplace-control action remains disabled.
 
-The configuration-driven implementation is on the **`v3` branch**. The entry point is
+This README describes the **v3 configuration-driven implementation**. Use
+`master` for production; the `v3` branch is also retained. The entry point is
 [`fireplace.js`](fireplace.js).
+
+## What changed in v3
+
+| Area | Behavior |
+|---|---|
+| Devices and routes | Device names, GPIOs, polarity, relay modes, pulse durations, and sensor polling come from `config.json`, not device-specific branches in the Node code. |
+| Multiple Pis | Each Pi runs the same code with its own configuration and one Hubitat app instance. Notifications and new child IDs are isolated per instance. |
+| Manual input | Each maintained relay can optionally monitor an input and independently enable manual control. The included fireplace input remains monitoring-only. |
+| Discovery | Every configured device is advertised, regardless of ordering. Only identity fields are sent to Hubitat, not GPIO or manual-input settings. |
+| Existing Hubitat children | Discovery reuses matching legacy children without replacing their IDs or labels. Removing configuration does not automatically delete children. |
+| HTTP status | All relays use the same `physicalrelay` field; device-specific garage aliases were removed. |
+| Readability | The single-file Node structure remains, with documented functions, meaningful runtime names, and obsolete code/comments removed. |
+
+The GPIO libraries and hardware backend have not changed. This is not a
+Python rewrite or a Pi 5 compatibility migration. No dependencies were added
+by v3; an existing installation with the same dependency manifests does not
+need `npm ci` solely for this upgrade.
 
 ## Hardware and wiring
 
@@ -89,7 +107,7 @@ sudo apt install build-essential python3 pkg-config
 Clone and install directly on the Pi:
 
 ```bash
-git clone --branch v3 https://github.com/Welasco/NodeFirePlaceHubitat.git
+git clone --branch master https://github.com/Welasco/NodeFirePlaceHubitat.git
 cd NodeFirePlaceHubitat
 npm ci
 ```
@@ -101,6 +119,9 @@ backend uses the bundled BCM2835 library.
 ## Configuration and starting
 
 Edit [`config.json`](config.json):
+
+Use the checked-in `config.json` as the template. `config.ORG.json` is a
+historical file and is not read by the service.
 
 | Setting | Purpose |
 |---|---|
@@ -130,6 +151,15 @@ Each device needs `type`, `devicetypename`, `name`, `label`, and `gpio`:
 | `pollIntervalMs` | Required for temperature devices; currently `900000` (15 minutes). |
 | `manualInput` | Optional input belonging to a maintained relay; see below. |
 
+The included per-device values are:
+
+| Name | Driver | BCM GPIO | Mode / sensor | Timing |
+|---|---|---:|---|---|
+| `fireplace` | RPi Managed Switch | 23 | Maintained, active-low | No automatic OFF timer |
+| `garagedoor` | RPi Managed Switch | 24 | Momentary, active-low | `pulseMs: 4500` |
+| `garagegate` | RPi Managed Switch | 25 | Momentary, active-low | `pulseMs: 4500` |
+| `fireplacetemperature` | RPi Managed Temperature | 21 | DHT11 (`sensorType: 11`) | `pollIntervalMs: 900000` |
+
 Only listed devices are initialized and advertised. A Pi can have a different
 number of devices, different names, and different GPIO assignments. Removing
 a device from configuration does not automatically delete its Hubitat child.
@@ -144,19 +174,48 @@ startup before GPIO initialization. Older discovery-only configurations must
 be updated with the new hardware fields. Timer intervals must be positive
 integers no larger than `2147483647` milliseconds.
 
+### Adding, changing, or removing devices
+
+To add a device, add its complete descriptor to `discover.devices`, restart
+the Pi service, and run discovery on that Pi's Hubitat app instance. No Express
+route or GPIO source-code edit is needed. Changing an existing device's GPIO
+or timing also requires a restart, but not rediscovery if its identity stays
+the same.
+
+Use Hubitat Labels for friendly naming. Editing a child device's Name after
+discovery does not change its API identity because the driver uses the stored
+`rpiDeviceName`. To deliberately change the configured `name`, plan for a new
+child and update any automations that should use it.
+
+Removing a descriptor and restarting stops initializing, advertising, polling,
+and serving that device; requests to its former API path return HTTP 404.
+The Hubitat child remains, can retain its last reported state, and is not
+removed by subsequent discovery. Check its automation references and remove
+that child manually in Hubitat if it is no longer needed. Do not uninstall
+the app to remove one device: uninstalling deletes all of that app's children.
+
+Removing a relay from configuration does not drive its old GPIO OFF. Likewise,
+stopping the process is not an OFF command. Verify a safe hardware state before
+removing a relay or changing its pin assignment.
+
 ### Optional manual input
 
 The included fireplace entry contains:
 
 ```json
-"manualInput": {
-  "gpio": 4,
-  "activeLow": false,
-  "controlEnabled": false,
-  "checkIntervalMs": 500,
-  "checkCount": 2
+{
+  "manualInput": {
+    "gpio": 4,
+    "activeLow": false,
+    "controlEnabled": false,
+    "checkIntervalMs": 500,
+    "checkCount": 2
+  }
 }
 ```
+
+These fields belong inside the maintained relay's descriptor; this fragment
+is not a complete `config.json`.
 
 Keep `controlEnabled: false` to monitor/filter input changes without controlling
 the relay. To test manual control later, set it to `true` **for that device**
@@ -238,6 +297,23 @@ Temperature read failures return HTTP 500 and are logged.
 All relay names return `{ "<name>": "OFF", "physicalrelay": "OFF" }` for an OFF
 reading. Relay status responses use the same fields regardless of the device name.
 
+The old `physicalrelaygarage` and `physicalrelaygaragegate` response aliases
+are no longer returned. Update external clients that read those keys to use
+`physicalrelay`. The configured-name key (such as `garagegate`) and Hubitat's
+`device`/`command` notification format are unchanged; the managed Hubitat
+drivers do not consume those removed aliases.
+
+Unknown devices and unsupported commands return HTTP 404. Successful relay
+commands return an empty response body; state is delivered through Hubitat
+notifications. Temperature status returns the existing fields:
+
+```json
+{"vartemperatureF":68,"vartemperatureC":"20.0","varhumidity":"50.0"}
+```
+
+The temperature HTTP response uses a numeric Fahrenheit value and string
+Celsius/humidity values. This format is retained for compatibility.
+
 ### Garage pulse duration
 
 Momentary relays share `pulseRelay(deviceName)` in `fireplace.js`.
@@ -311,16 +387,21 @@ two Pis may both have a device called `fireplace` without collisions.
 Discovery stores `rpiDeviceName` on each child. Drivers use this stable name
 for requests, rather than a friendly/edited Hubitat device name.
 
-### Upgrading the existing Hubitat installation
+### Upgrading an existing Pi and Hubitat installation
 
 1. Create/download a Hubitat backup under Settings > Backup and Restore.
 2. Update the managed app and both managed drivers above, retaining the existing
-   installed app instance and its Pi address. Do not uninstall/reinstall it.
-3. Deploy the `v3` Node code and updated configuration to the first Pi, then
-   restart. Restart initializes relays OFF.
+   installed app instance and its Pi address. In Apps Code and Drivers Code,
+   replace the source in the existing entries and save; do not create duplicate
+   code entries or uninstall/reinstall the app.
+3. Update the first Pi using the Git/config procedure below. Preserve its
+   actual hardware settings and leave `manualInput.controlEnabled: false`
+   until ready to test. Restart initializes all configured relays OFF.
 4. Enable Discover Devices on the existing app and save/Done. Discovery matches
    its legacy children, keeps their network IDs and labels, and records their
-   configured names. Refresh the devices afterward.
+   configured names. Wait at least 10 seconds, refresh the devices, and check
+   the Pi/Hubitat logs. Verify relay commands only when it is safe to operate
+   the connected equipment.
 5. Deploy the same code with the second Pi's configuration, add a second managed
    app instance with that Pi's address, and enable discovery on that instance.
 
@@ -340,6 +421,58 @@ Official documentation:
 [child-device methods](https://docs2.hubitat.com/en/developer/app/app-object),
 [preference updates](https://docs2.hubitat.com/en/developer/app/installedapp-object),
 and [backup/restore](https://docs2.hubitat.com/en/user-interface/settings/backup-and-restore).
+
+### Configuring a second Pi
+
+Install the same Node code and dependencies on the second Pi. Its local
+`config.json` defines only the devices physically connected to that board.
+For example, a second Pi with a maintained relay on BCM17 and a DHT11 on BCM21
+could use:
+
+```json
+{
+  "httpport": 3001,
+  "notify": {
+    "address": "192.168.2.201",
+    "port": "39500"
+  },
+  "relayReportIntervalMs": 300000,
+  "discover": {
+    "type": "discover",
+    "devices": [
+      {
+        "type": "switch",
+        "devicetypename": "RPi Managed Switch",
+        "name": "workshoplight",
+        "label": "Workshop Light",
+        "gpio": 17,
+        "activeLow": true,
+        "mode": "maintained"
+      },
+      {
+        "type": "temperature",
+        "devicetypename": "RPi Managed Temperature",
+        "name": "roomtemperature",
+        "label": "Room Temperature",
+        "gpio": 21,
+        "sensorType": 11,
+        "pollIntervalMs": 900000
+      }
+    ]
+  }
+}
+```
+
+Adapt this example to the actual wiring and Hubitat address. It intentionally
+has no `manualInput`, so no input GPIO is created. The example creates
+`/api/workshoplight`, `/api/workshoplight/on`, `/api/workshoplight/off`, and
+`/api/roomtemperature` without any code changes.
+
+`notify.address` is the **Hubitat address**, not the Pi's own address. Configure
+the second Pi's distinct IPv4 address in its own Hubitat app instance. Both
+Pis may use port 3001 because they have different addresses, and both can
+notify the same hub. The managed app and driver code entries are shared;
+install a second app instance, not a second copy of the code.
 
 ## Running as a systemd service
 
@@ -371,22 +504,95 @@ above. Application logs are also written to `fireplace.log`.
 
 ## Updating and troubleshooting
 
-From the repository directory:
+### Updating code and preserving each Pi's configuration
+
+Run updates from the repository directory on the Pi, not from the development
+machine. Schedule downtime while relay interruption is acceptable. Stop any
+manually started process instead if this Pi is not running the systemd service.
+Stopping alone does not guarantee outputs are OFF.
 
 ```bash
+sudo systemctl stop fireplace.service
+cp config.json ../fireplace-config.before-v3.json
 git status
-git diff --summary
-git diff -- fireplace.js config.json
-git pull --ff-only origin v3
+git diff -- config.json
 ```
 
-Subscription changes can modify the tracked `config.json`. Preserve local
-callback settings when resolving pull conflicts; do not blindly overwrite it.
-The executable bit for `fireplace.js` is tracked in Git.
+Choose a fresh backup filename if that backup already exists. Subscription
+changes can modify the tracked `config.json`, even if you have not edited it
+manually. Preserve any other local changes as well; do not force a checkout
+or reset the repository to bypass conflicts.
 
-Run `npm ci` again when dependency manifests change, then restart the app or
-service. Restart initializes all relays OFF.
+If `config.json` has local edits, stash only that file before switching/pulling:
 
+```bash
+git stash push -m "Pi config before v3 upgrade" -- config.json
+```
+
+Then update the production branch:
+
+```bash
+git fetch origin
+git switch master
+git pull --ff-only origin master
+```
+
+If intentionally staying on `v3`, use `git switch v3` and
+`git pull --ff-only origin v3` instead. A pull updates files; it does not restart
+the Node process or update code installed in Hubitat.
+
+Review the new `config.json` and copy the correct per-Pi settings from the
+backup, retaining the new fields such as `mode`, `gpio`, `activeLow`,
+`relayReportIntervalMs`, and sensor/manual-input settings. Do not replace the
+new file wholesale with a discovery-only configuration from an older version.
+If a stash was created, inspect it with:
+
+```bash
+git stash list
+git stash show -p 'stash@{0}'
+```
+
+Select the correct entry if other stashes exist. Do not blindly run
+`git stash pop`: an old schema can remove required settings or cause conflicts.
+Alternatively, to intentionally discard both staged and unstaged config edits
+after backing them up:
+
+```bash
+git restore --source=HEAD --staged --worktree -- config.json
+```
+
+That restore command discards local settings and uses the committed file from
+the **current** branch. Check the resulting Hubitat address and wiring before
+starting the service. It does not merge an old configuration into the new one.
+
+Run `npm ci` if dependency manifests changed or dependencies need restoring;
+build native dependencies on the Pi itself. There are no dependency changes
+introduced by v3 relative to the preceding implementation. The executable bit
+for `fireplace.js` is tracked in Git.
+
+After configuration is ready:
+
+```bash
+sudo systemctl start fireplace.service
+sudo systemctl status fireplace.service --no-pager
+sudo journalctl -u fireplace.service -n 50 --no-pager
+curl --fail http://127.0.0.1:3001/
+curl --fail http://127.0.0.1:3001/api/fireplace
+```
+
+Use the configured port and a device name present on this Pi. These GET status
+requests do not operate the relay. The root response only confirms HTTP
+availability; sensor access and Hubitat delivery must be checked separately.
+Finish the Hubitat upgrade/discovery steps above. Reinstalling the systemd unit
+is not needed when its existing paths, user/group, and Node environment are
+already correct.
+
+### Troubleshooting
+
+- **Configuration error at startup:** use the v3 schema and inspect the logged
+  field/device name. `node --check fireplace.js` checks code syntax, not the
+  configuration schema or hardware. Check JSON syntax separately, for example
+  with `node -e 'JSON.parse(require("fs").readFileSync("config.json", "utf8"))'`.
 - **`EINVAL` exporting GPIO:** inspect `/sys/class/gpio/gpiochip*/label` and
   `base`; ensure the current automatic mapping code and supported controller
   are present. Do not replace BCM offsets with hard-coded global numbers.
@@ -397,7 +603,39 @@ service. Restart initializes all relays OFF.
 - **Address already in use:** check whether the systemd service or another app
   instance already owns port 3001.
 - **Hubitat state not updating:** check the callback destination, LAN reachability,
-  and queued/sending/accepted/retry messages in the logs.
+  configured Pi IPv4 address, and queued/sending/accepted/retry messages in the
+  logs. Run discovery in the correct app instance if it logs an unknown device.
+- **Device endpoint returns 404:** check the configured name, device type,
+  command, and whether the service was restarted after editing configuration.
+- **Manual input logs changes but does not control the relay:** this is expected
+  with `controlEnabled: false`. Check wiring/polarity before enabling it, and
+  remember that an unchanged input does not override an API command.
+- **Removed device still appears in Hubitat:** discovery is additive; remove
+  the old child manually after checking its automation references.
+
+## Code layout
+
+The runtime remains in `fireplace.js`, using the existing libraries and a
+function-based structure. Configuration and runtime state are separate:
+`deviceRegistry` holds each device's GPIO objects, confirmed/observed states,
+pulse timer, and optional manual-input state.
+
+| Functions | Responsibility |
+|---|---|
+| `loadConfiguredDevices`, `getRelayDevice` | Validate configuration and look up a configured relay. |
+| `getRelayOutputLevel`, `getRelayStateLabel` | Translate between logical ON/OFF and polarity-dependent GPIO levels. |
+| `setRelayOutput`, `verifyAndReportRelayOutput`, `pulseRelay` | Operate, verify, and report maintained or momentary relay commands. |
+| `readRelayOutput`, `reportRelayStates` | Read outputs and reconcile Hubitat without operating relays. |
+| `readManualInput`, `checkManualInputChange` | Monitor and filter per-device manual input changes. |
+| `readTemperature` | Share one configured DHT reading path between HTTP and polling. |
+| `sendDeviceDiscovery` | Advertise configured identities only. |
+| `queueDeviceStateNotification`, `queueHubitatNotification`, `flushNotificationQueue`, `sendHubitatNotification` | Coalesce and deliver Hubitat updates with deadlines and retries. |
+
+The managed Hubitat app handles per-Pi routing, discovery, and legacy child
+matching. The two managed drivers send commands using `rpiDeviceName` and apply
+the notifications they receive from their parent app. The older
+`FirePlaceApp.groovy`, `FirePlaceDeviceType.groovy`, and
+`GaragePushableButton.groovy` files are not required for this managed setup.
 
 ## Tests
 
