@@ -8,6 +8,7 @@ class TestChild {
     String label
     Map data = [:]
     List commands = []
+    List events = []
     String driverType
     boolean component
     Map registry
@@ -17,7 +18,10 @@ class TestChild {
     String getDisplayName() { return label }
     String getDataValue(String key) { return data[key] }
     void updateDataValue(String key, String value) { data[key] = value }
-    void Rpiparse(String command) { commands << command }
+    void Rpiparse(String command) {
+        commands << command
+        driver.Rpiparse(command)
+    }
     void parse(String description) { driver.parse(description) }
     void setLabel(String value) { label = value }
     void setDeviceNetworkId(String value) {
@@ -91,7 +95,31 @@ abstract class HubitatTestScript extends Script {
     void asynchttpGet(String callback, Map params, Map data) {
         httpRequests << [callback: callback, params: params, data: data]
     }
-    Map parseLanMessage(String description) { return new JsonSlurper().parseText(description) }
+    Map parseLanMessage(String description) {
+        if (description.startsWith("{")) return new JsonSlurper().parseText(description)
+        def message = description.split(",").collectEntries {
+            def field = it.split(":", 2)
+            [(field[0].trim()): field[1].trim()]
+        }
+        if (message.headers) {
+            def header = new String(message.headers.decodeBase64(), "UTF-8")
+            message.header = header
+            message.headers = header.split(/\r\n/).findAll { it }.collectEntries {
+                def field = it.split(":", 2)
+                [(field[0].trim()): field.size() == 2 ? field[1].trim() : null]
+            }
+        }
+        if (message.body) {
+            message.body = new String(message.body.decodeBase64(), "UTF-8")
+            if (message.headers["Content-Type"] == "application/json") {
+                message.json = new JsonSlurper().parseText(message.body)
+                message.data = message.json
+            }
+        }
+        return message
+    }
+    void sendEvent(Map event) { device.events << event }
+    String getTemperatureScale() { return "F" }
     List getChildDevices() { return children }
     void sendHubCommand(Object command) {
         if (beforeSend) beforeSend.call(command)
@@ -145,8 +173,12 @@ loadScript = { String filename ->
     }
     return script
 }
-def event = { String address, Map payload ->
-    JsonOutput.toJson([networkAddress: address, json: payload])
+def event = { String address, Map payload, String contentType = "application/json" ->
+    def headers = "NOTIFY /notify HTTP/1.1\r\nContent-Type: ${contentType}\r\n\r\n"
+    def body = JsonOutput.toJson(payload)
+    String description = "mac:B827EB000001, ip:${address}, port:CCA8, " +
+        "headers:${headers.getBytes('UTF-8').encodeBase64()}, body:${body.getBytes('UTF-8').encodeBase64()}"
+    return description
 }
 def descriptors = [
     [type: "temperature", devicetypename: "RPi Managed Temperature", name: "roomtemperature", label: "Room"],
@@ -220,6 +252,16 @@ def routeLan = { String address, Map payload ->
 assert !routeLan("C0A8020C", [type: "discover", devices: descriptors])
 assert routeLan("C0A8020A", [type: "discover", devices: descriptors])
 assert routeLan("C0A8020B", [type: "discover", devices: descriptors])
+assert routeLan("C0A8020A", [device: "roomtemperature", command: "68-50.0"])
+assert routeLan("C0A8020B", [device: "roomtemperature", command: "72-40.0"])
+assert first.children[0].events == [
+    [name: "temperature", value: "68", unit: "F"],
+    [name: "humidity", value: "50.0", unit: "%"]
+]
+assert second.children[0].events == [
+    [name: "temperature", value: "72", unit: "F"],
+    [name: "humidity", value: "40.0", unit: "%"]
+]
 assert second.children*.deviceNetworkId == ["C0A8020B", "42:fireplace", "42:garagedoor"]
 assert first.registry.size() == 6
 assert routeLan("C0A8020A", [type: "discover", devices: descriptors.reverse()])
@@ -232,6 +274,7 @@ first.lanResponseHandler(event("C0A8020B", [device: "fireplace", command: "ON"])
 assert firstFireplace.commands.empty
 assert routeLan("c0a8020a", [device: "fireplace", command: "ON"])
 assert firstFireplace.commands == ["ON"]
+assert firstFireplace.events == [[name: "switch", value: "on"]]
 assert secondFireplace.commands.empty
 assert routeLan("C0A8020B", [device: "fireplace", command: "OFF"])
 assert secondFireplace.commands == ["OFF"]
@@ -242,6 +285,9 @@ first.lanResponseHandler(JsonOutput.toJson([networkAddress: "C0A8020A",
 first.lanResponseHandler(JsonOutput.toJson([networkAddress: "C0A8020A",
     data: JsonOutput.toJson([device: "garagedoor", command: "ON"])]))
 assert firstDoor.commands == ["ON", "OFF", "ON"]
+first.lanResponseHandler(event("C0A8020A", [device: "garagedoor", command: "OFF"], "text/plain"))
+assert first.errors.empty: first.errors
+assert firstDoor.commands.last() == "OFF"
 
 def legacy = loadScript("Hubitat/RPiManagedApp.groovy")
 legacy.app.id = 43
@@ -358,6 +404,10 @@ completeDiscovery(sensorOnly, descriptors.take(1))
 assert sensorOnly.children.size() == 1
 sensorOnly.children[0].parse(event("C0A8020A", [device: "roomtemperature", command: "68-50.0"]))
 assert sensorOnly.children[0].commands == ["68-50.0"]
+assert sensorOnly.children[0].events == [
+    [name: "temperature", value: "68", unit: "F"],
+    [name: "humidity", value: "50.0", unit: "%"]
+]
 
 def manualDiscovery = loadScript("Hubitat/RPiManagedApp.groovy")
 manualDiscovery.settings.enableDiscovery = false
@@ -433,6 +483,8 @@ assert removed.children.empty
 assert removed.sent.empty
 
 def unknownEvent = event("C0A8020A", [device: "missing", command: "ON"])
+first.lanResponseHandler(JsonOutput.toJson([json: [device: "fireplace", command: "ON"]]))
+assert first.warnings.last().contains("no source IP")
 first.lanResponseHandler(unknownEvent)
 assert first.warnings.last().contains("Unknown device")
 first.lanResponseHandler(JsonOutput.toJson([networkAddress: "C0A8020A", body: "{invalid"]))

@@ -165,7 +165,13 @@ def lanResponseHandler(evt) {
     try{
       def description = evt instanceof String ? evt : evt.description
       def map = parseLanMessage(description)
-      if (map.networkAddress?.toUpperCase() != GetDeviceID()) {
+      def sourceAddress = map.ip ?: map.networkAddress
+      if (!sourceAddress) {
+        log.warn "RPiManagedApp - LAN message has no source IP; cannot route it"
+        return
+      }
+      if (sourceAddress.toUpperCase() != GetDeviceID()) {
+        writeLog("RPiManagedApp - Ignoring LAN message from ${sourceAddress}; expected ${GetDeviceID()}")
         return
       }
       def headers = map.headers;

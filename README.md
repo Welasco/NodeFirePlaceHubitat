@@ -410,6 +410,9 @@ fix the reported problem and save/Done again. Superseded HTTP responses are igno
 Use only one managed app instance for a given Pi on the same hub.
 
 Each app accepts LAN notifications only from its configured Pi IP address.
+Hubitat's `parseLanMessage()` exposes the sender as `ip` (hexadecimal), not
+`networkAddress`; the app reads `ip` first and retains the latter as a legacy
+fallback. Messages without a source IP are logged and rejected.
 Callback source ports are not filtered: Node's outgoing callback connections
 do not originate from its HTTP listening port. Use a stable address/DHCP
 reservation per Pi; IP filtering is routing isolation, not authentication.
@@ -673,6 +676,10 @@ already correct.
 - **Hubitat state not updating:** check the callback destination, LAN reachability,
   configured Pi IPv4 address, and queued/sending/accepted/retry messages in the
   logs. Run discovery in the correct app instance if it logs an unknown device.
+- **Requests reach the Pi but Hubitat ignores returned states:** update the managed
+  app code to the version that reads the native LAN sender field `ip`. Earlier
+  v3 code checked only `networkAddress` and discarded native Hubitat messages
+  before updating children. This correction needs no additional Pi-side change.
 - **Hubitat "no matching device found" warning:** update Node and the existing
   app/drivers, then save the app instance as described above. Confirm its receiver's
   ID matches its configured Pi IP in uppercase hex, and that another app/device
@@ -734,7 +741,9 @@ groovy test/hubitat-managed-app.groovy
 ```
 
 They parse HTTP discovery JSON in an app callback and model IP-based LAN matching
-through the actual switch/temperature driver's `parse` method. They cover
+using native comma-separated descriptions, hex `ip` fields, and Base64 headers/body.
+The actual switch/temperature drivers run `parse()`, `Rpiparse()`, and `sendEvent()`,
+so the checks verify device events, not just app dispatch. They cover
 registration before subscription, multiple instances, app naming, sensor-only
 Pis, receiver replacement/IP updates, legacy child preservation, stable driver
 routes, malformed/failed HTTP responses, and superseded callbacks.
