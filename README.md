@@ -21,9 +21,10 @@ This README describes the **v3 configuration-driven implementation**. Use
 |---|---|
 | Devices and routes | Device names, GPIOs, polarity, relay modes, pulse durations, and sensor polling come from `config.json`, not device-specific branches in the Node code. |
 | Multiple Pis | Each Pi runs the same code with its own configuration and one Hubitat app instance. Notifications and new child IDs are isolated per instance. |
+| First device and app name | The app retrieves discovery JSON first, then uses a configured appliance as its IP-based LAN receiver. No additional driver or receiver device is needed. App Name can be set during installation or later. |
 | Manual input | Each maintained relay can optionally monitor an input and independently enable manual control. The included fireplace input remains monitoring-only. |
 | Discovery | Every configured device is advertised, regardless of ordering. Only identity fields are sent to Hubitat, not GPIO or manual-input settings. |
-| Existing Hubitat children | Discovery reuses matching legacy children without replacing their IDs or labels. Removing configuration does not automatically delete children. |
+| Existing Hubitat children | Discovery reuses matching children and preserves their labels. Legacy IP-based receivers retain their IDs; a namespaced child selected as receiver changes only its network ID. Removing configuration does not automatically delete children. |
 | HTTP status | All relays use the same `physicalrelay` field; device-specific garage aliases were removed. |
 | Readability | The single-file Node structure remains, with documented functions, meaningful runtime names, and obsolete code/comments removed. |
 
@@ -276,6 +277,7 @@ and `/api/:name/off`. The table shows the included configuration.
 | `/api/garagegate/off` | Confirm/report its state; does not cancel an active pulse. |
 | `/api/fireplacetemperature` | Read temperature in Fahrenheit/Celsius and humidity, and notify Hubitat. |
 | `/discover` | Send configured device descriptors to Hubitat, not in the HTTP response body. |
+| `/discover?response=json` | Return the same descriptors as HTTP JSON without sending a discovery notification or operating GPIOs. |
 | `/subscribe/:host` | Save a callback destination such as `HUB_IP:39500`, then report relay states. |
 
 For example, this reads the garage-gate relay without operating it:
@@ -371,35 +373,99 @@ Install these files in Hubitat:
 | [`Hubitat/RPiManagedSwitch.groovy`](Hubitat/RPiManagedSwitch.groovy) | Drivers Code |
 | [`Hubitat/RPiManagedTemperature.groovy`](Hubitat/RPiManagedTemperature.groovy) | Drivers Code |
 
-Add one RPi Managed App instance **per Pi**, configure its Pi address/port, and
-enable discovery. Give the instances distinct app labels so they are easy to
-identify. The app registers its callback address and schedules discovery after
-10 seconds. It then turns the discovery preference off.
+Update the Pi service first: the app requires `/discover?response=json`.
+Add one RPi Managed App instance **per Pi**, enter an **App Name** such as
+`Fireplace Pi` or `Workshop Pi`, configure its Pi IPv4 address/port, and enable
+discovery. App Name is optional and can be changed by reopening the instance;
+blank names preserve its current label. Renaming the app does not relabel its
+relay or sensor children.
+
+On installation or save, the app retrieves `/discover?response=json` using
+Hubitat's asynchronous HTTP client. This response is delivered to the app's
+callback on the requested HTTP connection, so it does not require a LAN receiver
+to exist already. The callback validates the descriptors, then restores the
+original first-device approach without hardcoding a fireplace:
+
+- Reuse an existing IP-based receiver, or one previously marked as the receiver.
+- Otherwise use the first device in `discover.devices`, with its configured
+  name, label, and managed driver. Reuse a matching existing child when possible.
+- Assign that child's network ID to the Pi's uppercase hexadecimal IP address,
+  store `rpiDeviceName` and `rpiLanReceiver`, then add remaining children if
+  Discover Devices is enabled.
+- Only after registration succeeds, send the callback subscription to the Pi.
+
+Hubitat matches incoming LAN traffic to an uppercase hexadecimal IP- or MAC-based
+device network ID; namespaced appliance IDs alone cannot receive these messages.
+Both managed drivers forward their `parse()` messages to the parent app, so a
+relay or a sensor can be the receiver. It remains a normal configured appliance,
+not a separate virtual endpoint. With the included configuration, `fireplace`
+is the first device. Sensor-only Pis work too.
+
+There is no fixed 10-second discovery delay. The callback creates children
+before subscribing, and clears Discover Devices after successful discovery.
+With discovery disabled, a fresh app still creates the receiver but does not
+add the other children. HTTP failures, invalid JSON/descriptors, missing drivers,
+or another app/device owning the Pi's LAN ID are logged and prevent subscription;
+fix the reported problem and save/Done again. Superseded HTTP responses are ignored.
+Use only one managed app instance for a given Pi on the same hub.
 
 Each app accepts LAN notifications only from its configured Pi IP address.
 Callback source ports are not filtered: Node's outgoing callback connections
 do not originate from its HTTP listening port. Use a stable address/DHCP
 reservation per Pi; IP filtering is routing isolation, not authentication.
 
-All descriptors are discovered, including the first; there is no automatically
-created fireplace. New child network IDs use `<app-id>:<configured-name>`, so
-two Pis may both have a device called `fireplace` without collisions.
+All descriptors are discovered, including the first; no fireplace is created
+unless it is configured. The receiver uses the Pi's hex-IP ID; other new child
+network IDs use `<app-id>:<configured-name>`, so two Pis may both have a device
+called `fireplace` without collisions.
 Discovery stores `rpiDeviceName` on each child. Drivers use this stable name
 for requests, rather than a friendly/edited Hubitat device name.
+Changing a Pi address and saving updates the existing receiver's network ID
+without recreating it or the other children. Reordering configuration alone
+does not replace a receiver already registered.
+
+Discovery remains additive. Removing the receiver from configuration leaves its
+Hubitat child in place, still forwarding notifications, with a warning on save.
+If you remove that child manually, save/Done the app afterward so it can select
+a replacement from the current configuration. A fresh app needs at least one
+configured device to create a receiver.
+
+### Repairing a new instance that reports "no matching device found"
+
+Early v3 app code created namespaced appliance children but omitted the IP-based
+LAN receiver. Existing installations could still work because their legacy
+fireplace child supplied it, while fresh instances could not receive discovery
+or state updates. The Hubitat system warning means traffic arrived at the hub
+but had no matching device network ID; changing the source port is not the fix.
+
+1. Update the Pi service, preserving `config.json`, and restart it when safe;
+   restart initializes configured outputs OFF. Confirm
+   `curl --fail 'http://PI_IP:3001/discover?response=json'` returns discovery JSON.
+2. Update the existing managed app and both managed drivers in Hubitat and save
+   their code. No additional driver is needed.
+3. Reopen the failing installed app, set its App Name and correct Pi address
+   (for example `192.168.2.243`), enable Discover Devices, and save/Done.
+4. Allow the HTTP callback to complete and check discovery/state updates.
+   A fresh instance for `192.168.2.243` should assign receiver ID `C0A802F3`
+   to its first configured appliance.
+
+Do not uninstall the working app or recreate its appliance children. This
+repair requires the updated Node discovery route and existing Hubitat code
+entries, but no new configuration fields or changes to your GPIO values.
 
 ### Upgrading an existing Pi and Hubitat installation
 
 1. Create/download a Hubitat backup under Settings > Backup and Restore.
-2. Update the managed app and both managed drivers above, retaining the existing
-   installed app instance and its Pi address. In Apps Code and Drivers Code,
-   replace the source in the existing entries and save; do not create duplicate
-   code entries or uninstall/reinstall the app.
-3. Update the first Pi using the Git/config procedure below. Preserve its
+2. Update the first Pi using the Git/config procedure below. Preserve its
    actual hardware settings and leave `manualInput.controlEnabled: false`
    until ready to test. Restart initializes all configured relays OFF.
+   Verify `/discover?response=json` returns JSON before saving the new app.
+3. Update the managed app and both managed drivers above, retaining the existing
+   installed app instance and its Pi address. Replace source in existing code
+   entries and save; do not duplicate those entries or uninstall/reinstall the app.
 4. Enable Discover Devices on the existing app and save/Done. Discovery matches
    its legacy children, keeps their network IDs and labels, and records their
-   configured names. Wait at least 10 seconds, refresh the devices, and check
+   configured names. Allow the HTTP callback to complete, refresh devices, and check
    the Pi/Hubitat logs. Verify relay commands only when it is safe to operate
    the connected equipment.
 5. Deploy the same code with the second Pi's configuration, add a second managed
@@ -418,6 +484,8 @@ the hub's configured temperature scale. Use a Fahrenheit-configured hub until
 that separate conversion issue is addressed.
 
 Official documentation:
+[LAN device routing](https://docs2.hubitat.com/en/developer/driver/building-a-lan-driver),
+[asynchronous HTTP methods](https://docs2.hubitat.com/en/developer/common-methods-object#asynchttpget),
 [child-device methods](https://docs2.hubitat.com/en/developer/app/app-object),
 [preference updates](https://docs2.hubitat.com/en/developer/app/installedapp-object),
 and [backup/restore](https://docs2.hubitat.com/en/user-interface/settings/backup-and-restore).
@@ -605,6 +673,15 @@ already correct.
 - **Hubitat state not updating:** check the callback destination, LAN reachability,
   configured Pi IPv4 address, and queued/sending/accepted/retry messages in the
   logs. Run discovery in the correct app instance if it logs an unknown device.
+- **Hubitat "no matching device found" warning:** update Node and the existing
+  app/drivers, then save the app instance as described above. Confirm its receiver's
+  ID matches its configured Pi IP in uppercase hex, and that another app/device
+  does not own that address. If you delete the child serving as LAN receiver,
+  save/Done the app afterward to register a replacement.
+- **Discovery HTTP/bootstrap failure:** check the Pi URL, service, and installed
+  managed drivers. `/discover?response=json` must return `type: "discover"` and
+  valid device descriptors; an empty response means the Node service needs updating.
+  Fix the logged error and save/Done again.
 - **Device endpoint returns 404:** check the configured name, device type,
   command, and whether the service was restarted after editing configuration.
 - **Manual input logs changes but does not control the relay:** this is expected
@@ -628,12 +705,13 @@ pulse timer, and optional manual-input state.
 | `readRelayOutput`, `reportRelayStates` | Read outputs and reconcile Hubitat without operating relays. |
 | `readManualInput`, `checkManualInputChange` | Monitor and filter per-device manual input changes. |
 | `readTemperature` | Share one configured DHT reading path between HTTP and polling. |
-| `sendDeviceDiscovery` | Advertise configured identities only. |
+| `getDeviceDiscovery`, `sendDeviceDiscovery` | Share configured identity descriptors between HTTP JSON and legacy notifications. |
 | `queueDeviceStateNotification`, `queueHubitatNotification`, `flushNotificationQueue`, `sendHubitatNotification` | Coalesce and deliver Hubitat updates with deadlines and retries. |
 
-The managed Hubitat app handles per-Pi routing, discovery, and legacy child
-matching. The two managed drivers send commands using `rpiDeviceName` and apply
-the notifications they receive from their parent app. The older
+The managed Hubitat app handles instance naming, asynchronous discovery,
+first-device LAN registration, and legacy child matching. Both managed drivers
+forward raw LAN messages to their parent app, send commands using
+`rpiDeviceName` and apply notifications from their parent app. The older
 `FirePlaceApp.groovy`, `FirePlaceDeviceType.groovy`, and
 `GaragePushableButton.groovy` files are not required for this managed setup.
 
@@ -655,8 +733,11 @@ With Java and Groovy installed, run the Hubitat mock checks from this directory:
 groovy test/hubitat-managed-app.groovy
 ```
 
-They cover multiple app instances, source-IP filtering, discovery ordering,
-legacy child preservation, stable driver routes, and error reporting.
+They parse HTTP discovery JSON in an app callback and model IP-based LAN matching
+through the actual switch/temperature driver's `parse` method. They cover
+registration before subscription, multiple instances, app naming, sensor-only
+Pis, receiver replacement/IP updates, legacy child preservation, stable driver
+routes, malformed/failed HTTP responses, and superseded callbacks.
 Neither suite validates physical wiring, relay contacts, or the installed
 Hubitat runtime. Test hardware behavior separately before connecting controlled
 loads, especially before enabling manual control.

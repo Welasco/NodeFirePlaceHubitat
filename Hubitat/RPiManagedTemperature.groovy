@@ -33,3 +33,8 @@ def sendRaspberryCommand(String command) {
 	def path = "/api/$command"
     parent.sendCommand(path);
 }
+
+// The configured sensor may also be the Pi's IP-based LAN receiver.
+def parse(description) {
+    parent.lanResponseHandler(description)
+}

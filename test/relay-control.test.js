@@ -195,6 +195,15 @@ function loadApp(options = {}) {
             });
             return response;
         },
+        discover(query = {}) {
+            const response = {
+                ended: false,
+                json(body) { this.body = JSON.parse(JSON.stringify(body)); this.ended = true; },
+                end() { this.ended = true; }
+            };
+            routes.get('/discover')({ query }, response);
+            return response;
+        },
         completeSave(error) {
             const callback = saves.shift();
             assert.ok(callback, 'Expected a pending configuration save');
@@ -888,6 +897,25 @@ test('discovery includes only configured descriptors, without GPIO and manual-in
         type: device.type, devicetypename: device.devicetypename, name: device.name, label: device.label
     })));
     assert.equal(app.messages[0].devices[0].name, 'fireplace');
+});
+
+test('JSON discovery bootstraps without notifications or hardware operations and keeps legacy discovery', () => {
+    const app = loadApp();
+    const response = app.discover({ response: 'json' });
+    assert.equal(response.ended, true);
+    assert.deepEqual(response.body, {
+        type: 'discover',
+        devices: app.config.discover.devices.map(device => ({
+            type: device.type, devicetypename: device.devicetypename, name: device.name, label: device.label
+        }))
+    });
+    assert.deepEqual(app.messages, []);
+    assert.deepEqual(app.requests, []);
+    assert.deepEqual(app.events, []);
+    const legacy = app.discover();
+    assert.equal(legacy.ended, true);
+    assert.equal(legacy.body, undefined);
+    assert.deepEqual(app.messages, [response.body]);
 });
 
 function confirmInput(app, device, value) {

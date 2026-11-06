@@ -219,8 +219,12 @@ api.get('/:device/:command', function handleRelayCommandRequest(req, res) {
     res.end();
 });
 
-// Queue discovery descriptors for Hubitat; the HTTP response has no body.
+// Return discovery JSON for bootstrap, or preserve the legacy notification-only response.
 app.get("/discover", function handleDiscoveryRequest(req, res) {
+    if (req.query.response === "json") {
+        res.json(getDeviceDiscovery());
+        return;
+    }
     sendDeviceDiscovery();
     res.end();
 });
@@ -469,9 +473,9 @@ setInterval(function reconcileRelayStates() {
     }
 }, relayReportIntervalMs);
 
-// Advertise configured device identities without exposing hardware settings.
-function sendDeviceDiscovery(){
-    var discovery = {
+// Describe configured device identities without exposing hardware settings.
+function getDeviceDiscovery(){
+    return {
         type: "discover",
         devices: Array.from(deviceRegistry.values()).map(function (item) {
             return {
@@ -482,6 +486,11 @@ function sendDeviceDiscovery(){
             };
         })
     };
+}
+
+// Advertise the same discovery descriptors through the legacy notification channel.
+function sendDeviceDiscovery(){
+    var discovery = getDeviceDiscovery();
     queueHubitatNotification(JSON.stringify(discovery));
     logMessage("Discovery","Sending devices back: " + JSON.stringify(discovery));
     return;

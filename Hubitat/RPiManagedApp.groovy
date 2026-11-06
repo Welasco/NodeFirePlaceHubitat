@@ -26,6 +26,10 @@ preferences {
 
 def page1() {
   dynamicPage(name: "page1", install: true, uninstall: true) {
+    section("App Name") {
+      input "appName", "text", title: "App Name", description: "(ie. Fireplace Pi or Workshop Pi)",
+        required: false, defaultValue: app.label ?: "RPi Managed App"
+    }
     section("RPi Endpoint") {
       input "proxyAddress", "text", title: "Proxy Address", description: "(ie. 192.168.1.10)", required: true
       input "proxyPort", "text", title: "Proxy Port", description: "(ie. 3001)", required: true, defaultValue: "3001"
@@ -47,22 +51,103 @@ def installed() {
 def updated() {
 
   writeLog("RPiManagedApp - Updated with settings: ${settings}")
+  if (settings.appName?.trim()) {
+    app.updateLabel(settings.appName.trim())
+  }
 	unsubscribe()
+  unschedule("discoverChildDevices")
 	initialize()
-  sendCommand('/subscribe/'+getNotifyAddress())
-  if (settings.enableDiscovery) {
-    // Allow subscription to finish before discovering devices.
-    runIn(10, "discoverChildDevices")
-    app.updateSetting("enableDiscovery", [value: "false", type: "bool"])
-  }    
 }
 
 def initialize() {
-    subscribe(location, null, "lanResponseHandler", [filterEvents:false])
+    requestDeviceDiscovery(settings.enableDiscovery == true)
     writeLog("RPiManagedApp - Initialize")
 }
 
+// Retrieve identities over the request's HTTP connection, without needing a LAN receiver.
+private requestDeviceDiscovery(boolean discoverAll) {
+  def deviceId = GetDeviceID()
+  state.discoveryRequestId = (state.discoveryRequestId ?: 0) + 1
+  asynchttpGet("deviceDiscoveryResponse", [
+    uri: "http://${getProxyAddress()}/discover",
+    query: [response: "json"],
+    contentType: "application/json",
+    timeout: 15
+  ], [requestId: state.discoveryRequestId, deviceId: deviceId,
+      host: getProxyAddress(), discoverAll: discoverAll])
+}
+
+// Ignore superseded responses; register children before enabling unsolicited notifications.
+def deviceDiscoveryResponse(response, data) {
+  if (data?.requestId != state.discoveryRequestId ||
+      data?.deviceId != GetDeviceID() || data?.host != getProxyAddress()) {
+    writeLog("RPiManagedApp - Ignoring superseded discovery response")
+    return
+  }
+  try {
+    if (response.hasError() || response.getStatus() != 200) {
+      log.error "RPiManagedApp - Discovery HTTP request failed (status ${response.getStatus()}); check the Pi address and service"
+      return
+    }
+    def discovery = response.getJson()
+    if (!(discovery instanceof Map) || discovery.type != "discover" || !(discovery.devices instanceof List)) {
+      throw new IllegalArgumentException("Expected discovery JSON; update the Pi service to support /discover?response=json")
+    }
+    def names = []
+    discovery.devices.each {
+      if (!isValidDiscoveryDescriptor(it) || it.name in names) {
+        throw new IllegalArgumentException("Invalid or duplicate discovery descriptor: ${it}")
+      }
+      names << it.name
+    }
+    ensureFirstDevice(discovery.devices)
+    if (data.discoverAll) {
+      addChildDevices(discovery.devices)
+      app.updateSetting("enableDiscovery", [value: "false", type: "bool"])
+    }
+    sendCommand('/subscribe/'+getNotifyAddress())
+  }
+  catch(Exception err) {
+    log.error "RPiManagedApp - Discovery bootstrap failed; check the Pi JSON response, installed managed drivers, and LAN ID ownership: ${err.message}"
+  }
+}
+
+// Keep an existing receiver, or use the first configured appliance's driver and hex-IP ID.
+private ensureFirstDevice(devices) {
+  def deviceId = GetDeviceID()
+  def children = getChildDevices()
+  def receiver = children.find { it.deviceNetworkId == deviceId } ?:
+    children.find { it.getDataValue("rpiLanReceiver") == "true" }
+  def descriptor = receiver ? devices.find {
+    findRaspberryDevice(it.name)?.deviceNetworkId == receiver.deviceNetworkId
+  } : null
+  if (!receiver) {
+    if (!devices) {
+      throw new IllegalArgumentException("At least one configured device is required to create a LAN receiver")
+    }
+    descriptor = devices[0]
+    receiver = findRaspberryDevice(descriptor.name)
+    if (!receiver) {
+      receiver = addChildDevice("RPi Managed", descriptor.devicetypename, deviceId,
+        [name: descriptor.name, label: descriptor.label, completedSetup: true])
+    }
+  }
+  if (receiver.deviceNetworkId != deviceId) {
+    receiver.setDeviceNetworkId(deviceId)
+  }
+  if (descriptor) {
+    receiver.updateDataValue("rpiDeviceName", descriptor.name)
+  }
+  else {
+    log.warn "RPiManagedApp - LAN receiver is no longer configured; it remains a receiver until removed and the app is saved again"
+  }
+  receiver.updateDataValue("rpiLanReceiver", "true")
+  writeLog("RPiManagedApp - LAN receiver: ${receiver.displayName} - deviceId: ${deviceId}")
+  return receiver
+}
+
 def uninstalled() {
+    state.discoveryRequestId = (state.discoveryRequestId ?: 0) + 1
     removeChildDevices()
 }
 
@@ -72,7 +157,7 @@ private removeChildDevices() {
 }
 
 def discoverChildDevices() {
-  sendCommand('/discover')
+  requestDeviceDiscovery(true)
   writeLog("RPiManagedApp - Sending discovery request")
 }
 
@@ -113,6 +198,14 @@ private processEvent(evt) {
   }
 }
 
+private isValidDiscoveryDescriptor(descriptor) {
+  return descriptor instanceof Map && descriptor.name instanceof String &&
+    descriptor.name ==~ /[A-Za-z0-9][A-Za-z0-9_-]*/ &&
+    descriptor.devicetypename instanceof String && descriptor.devicetypename.trim() &&
+    descriptor.label instanceof String && descriptor.label.trim() &&
+    descriptor.type in ["switch", "temperature"]
+}
+
 private addChildDevices(devices) {
   writeLog("RPiManagedApp - Start addChildDevices: ${devices}")
   if (!(devices instanceof List)) {
@@ -120,11 +213,7 @@ private addChildDevices(devices) {
     return
   }
   devices.each {
-    if (!(it instanceof Map) || !(it.name instanceof String) ||
-        !(it.name ==~ /[A-Za-z0-9][A-Za-z0-9_-]*/) ||
-        !(it.devicetypename instanceof String) || !it.devicetypename.trim() ||
-        !(it.label instanceof String) || !it.label.trim() ||
-        !(it.type in ["switch", "temperature"])) {
+    if (!isValidDiscoveryDescriptor(it)) {
       log.error "RPiManagedApp - Invalid discovery descriptor: ${it}"
       return
     }
@@ -197,8 +286,11 @@ def sendCommand(path) {
 }
 
 private String GetDeviceID(){
-    def deviceIP = settings.proxyAddress
-    def deviceId = deviceIP.tokenize( '.' )*.toInteger().asType( byte[] ).encodeHex().toString().toUpperCase()
+    def octets = settings.proxyAddress?.split(/\./, -1)
+    if (octets?.size() != 4 || octets.any { !(it ==~ /\d{1,3}/) || it.toInteger() > 255 }) {
+      throw new IllegalArgumentException("RPi Endpoint must be a valid IPv4 address")
+    }
+    def deviceId = octets*.toInteger().asType( byte[] ).encodeHex().toString().toUpperCase()
     return deviceId
 }
 
